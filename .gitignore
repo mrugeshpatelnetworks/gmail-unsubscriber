@@ -1,0 +1,36 @@
+# Google OAuth token — contains your access credentials, never commit this
+token.pickle
+
+# Google API credentials — contains your client secret, never commit this
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
