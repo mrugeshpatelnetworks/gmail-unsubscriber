@@ -3,11 +3,12 @@
 Gmail Promotional Email Unsubscriber
 -------------------------------------
 At startup you choose:
-  A) OAuth via credentials.json  — single account, Google Console setup once
-  B) App Password + IMAP         — enter email + password in terminal,
-                                   supports as many accounts as you like
+  A) App Password + IMAP  — enter email + password in terminal,
+                            supports multiple accounts, no Google Console needed
+  B) OAuth / Gmail API    — opens browser, uses credentials.json, single account
 
-GitHub: https://github.com/YOUR_USERNAME/gmail-unsubscriber
+Uses plain input() prompts — works in every terminal (cmd, PowerShell,
+Windows Terminal, VS Code, Mac/Linux).
 """
 
 import re
@@ -16,11 +17,12 @@ import imaplib
 import smtplib
 import pickle
 import webbrowser
+import getpass
+import sys
 from pathlib import Path
 from collections import defaultdict
 from email.mime.text import MIMEText
 
-import questionary
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, MofNCompleteColumn
@@ -48,32 +50,127 @@ IMAP_PORT = 993
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
+# (search_flag, imap_folder, optional_gm_raw_filter)
 SCAN_MODES = {
-    "all_unread":  ("All unread emails  (catches promos Gmail missed)",
-                    "UNSEEN",  '"[Gmail]/All Mail"', None),
-    "all_mail":    ("All emails — read + unread  (most thorough)",
-                    "ALL",     '"[Gmail]/All Mail"', None),
-    "promos_only": ("Promotions folder only",
-                    "ALL",     '"[Gmail]/All Mail"', "category:promotions"),
-    "inbox":       ("Inbox only  (unread)",
-                    "UNSEEN",  "INBOX",              None),
+    "1": ("All unread emails  (recommended — catches mislabelled promos)",
+          "UNSEEN", '"[Gmail]/All Mail"', None),
+    "2": ("All emails — read + unread  (most thorough, slower)",
+          "ALL",    '"[Gmail]/All Mail"', None),
+    "3": ("Promotions folder only",
+          "ALL",    '"[Gmail]/All Mail"', "category:promotions"),
+    "4": ("Inbox only  (unread)",
+          "UNSEEN", "INBOX",              None),
 }
 
 console = Console()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IMAP helpers
+# Simple terminal UI  (no prompt_toolkit / questionary)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _imap_connect(email: str, password: str) -> imaplib.IMAP4_SSL:
-    """Open an authenticated IMAP connection. Raises on failure."""
-    mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-    mail.login(email, password)
-    return mail
+def _print_menu(title: str, options: list[str]):
+    console.print(f"\n[bold]{title}[/bold]")
+    for i, opt in enumerate(options, 1):
+        console.print(f"  [cyan]{i}[/cyan])  {opt}")
 
 
-def _parse_from_str(value: str) -> tuple:
+def ask_select(title: str, options: list[str], default: int = 1) -> int:
+    """Numbered menu. Returns 1-based choice index."""
+    _print_menu(title, options)
+    while True:
+        try:
+            raw = input(f"\nEnter number [1-{len(options)}] (default {default}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[yellow]Cancelled.[/yellow]")
+            sys.exit(0)
+        if raw == "":
+            return default
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw)
+        console.print(f"[red]Please enter a number between 1 and {len(options)}.[/red]")
+
+
+def ask_checkbox(title: str, options: list[str]) -> list[int]:
+    """
+    Checkbox menu — toggle by number, 'a' = all, Enter = confirm.
+    Returns list of selected 1-based indices.
+    """
+    selected: set[int] = set()
+
+    while True:
+        console.print(f"\n[bold]{title}[/bold]")
+        for i, opt in enumerate(options, 1):
+            mark = "[green]✓[/green]" if i in selected else "[ ]"
+            console.print(f"  {mark} [cyan]{i}[/cyan])  {opt}")
+        console.print(
+            "\n  [dim]Type a number to toggle · [bold]a[/bold] = select all / "
+            "deselect all · [bold]Enter[/bold] = confirm · [bold]q[/bold] = quit[/dim]"
+        )
+        try:
+            raw = input("  > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[yellow]Cancelled.[/yellow]")
+            sys.exit(0)
+
+        if raw in ("", "done"):
+            return sorted(selected)
+        if raw == "q":
+            return []
+        if raw == "a":
+            selected = set(range(1, len(options) + 1)) if len(selected) < len(options) else set()
+        elif raw.isdigit() and 1 <= int(raw) <= len(options):
+            n = int(raw)
+            selected.discard(n) if n in selected else selected.add(n)
+        else:
+            console.print(f"[red]Invalid input.[/red]")
+
+
+def ask_confirm(title: str, default: bool = True) -> bool:
+    hint = "Y/n" if default else "y/N"
+    try:
+        raw = input(f"\n{title} [{hint}]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[yellow]Cancelled.[/yellow]")
+        sys.exit(0)
+    if raw == "":
+        return default
+    return raw in ("y", "yes")
+
+
+def ask_int(title: str, default: int) -> int:
+    try:
+        raw = input(f"\n{title} [default {default}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        sys.exit(0)
+    if raw == "":
+        return default
+    return int(raw) if raw.isdigit() and int(raw) > 0 else default
+
+
+def ask_text(title: str, validate=None) -> str:
+    while True:
+        try:
+            raw = input(f"{title}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            sys.exit(0)
+        if validate is None or validate(raw):
+            return raw
+        console.print("[red]Invalid input, try again.[/red]")
+
+
+def ask_password(title: str) -> str:
+    try:
+        return getpass.getpass(f"{title}: ")
+    except (EOFError, KeyboardInterrupt):
+        sys.exit(0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Email parsing helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_from_str(value: str) -> tuple[str, str]:
     m = re.match(r'^"?([^"<]*)"?\s*<([^>]+)>', value.strip())
     if m:
         return m.group(1).strip(), m.group(2).strip().lower()
@@ -94,58 +191,55 @@ def _parse_unsub_str(value: str) -> dict | None:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# IMAP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _imap_connect(email: str, password: str) -> imaplib.IMAP4_SSL:
+    mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    mail.login(email, password)
+    return mail
+
+
 def _imap_fetch_senders(mail: imaplib.IMAP4_SSL,
                          max_results: int,
                          mode_key: str,
                          account_email: str) -> dict:
-    """
-    Fetch unique senders from one IMAP connection.
-    Only reads From + List-Unsubscribe headers — body is never downloaded.
-    """
-    _, search_term, folder, gm_raw = SCAN_MODES[mode_key]
+    """Fetch unique senders — only reads From + List-Unsubscribe headers."""
+    _, search_flag, folder, gm_raw = SCAN_MODES[mode_key]
 
-    # Select folder (read-only for safety during scan)
     typ, _ = mail.select(folder, readonly=True)
     if typ != "OK":
-        raise RuntimeError(f"Cannot open folder {folder} for {account_email}")
+        raise RuntimeError(f"Cannot open folder {folder}")
 
-    # Search for message UIDs
     if gm_raw:
-        # Gmail-specific IMAP extension for category search
-        typ, data = mail.uid("SEARCH", "CHARSET", "UTF-8",
-                             "X-GM-RAW", gm_raw)
+        typ, data = mail.uid("SEARCH", "CHARSET", "UTF-8", "X-GM-RAW", gm_raw)
     else:
-        typ, data = mail.uid("SEARCH", None, search_term)
+        typ, data = mail.uid("SEARCH", None, search_flag)
 
     if typ != "OK" or not data or not data[0]:
         return {}
 
-    all_uids = data[0].split()          # list of bytes, e.g. [b'1', b'2', ...]
-    # Work newest-first, cap at max_results
-    uids_to_fetch = all_uids[-max_results:][::-1]
+    all_uids = data[0].split()
+    uids_to_fetch = all_uids[-max_results:][::-1]   # newest first
 
     senders: dict = defaultdict(lambda: {
         "name": "", "email": "", "count": 0,
         "unsubscribe": None, "account": account_email,
     })
 
-    BATCH = 50   # fetch 50 headers per IMAP round-trip
-
+    BATCH = 50
     with Progress(
         SpinnerColumn(),
         TextColumn(f"  [cyan]{account_email}[/cyan] scanning…"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        console=console,
-        transient=True,
+        BarColumn(), MofNCompleteColumn(),
+        console=console, transient=True,
     ) as progress:
         task = progress.add_task("", total=len(uids_to_fetch))
 
         for i in range(0, len(uids_to_fetch), BATCH):
-            batch = uids_to_fetch[i : i + BATCH]
-            # UIDs as a comma-separated ASCII string
+            batch   = uids_to_fetch[i : i + BATCH]
             uid_str = ",".join(u.decode() for u in batch)
-
             try:
                 typ, msg_data = mail.uid(
                     "FETCH", uid_str,
@@ -159,7 +253,6 @@ def _imap_fetch_senders(mail: imaplib.IMAP4_SSL,
                 progress.update(task, advance=len(batch))
                 continue
 
-            # IMAP FETCH response alternates: (metadata, header_bytes), b')', ...
             for item in msg_data:
                 if not isinstance(item, tuple) or len(item) < 2:
                     continue
@@ -167,26 +260,20 @@ def _imap_fetch_senders(mail: imaplib.IMAP4_SSL,
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8", errors="replace")
 
-                # Parse raw header block
-                from_val  = ""
-                unsub_val = ""
+                from_val = unsub_val = ""
                 for line in raw.splitlines():
                     ll = line.lower()
                     if ll.startswith("from:"):
                         from_val = line[5:].strip()
                     elif ll.startswith("list-unsubscribe:"):
                         unsub_val = line[17:].strip()
-                    elif line.startswith((" ", "\t")):
-                        # Header continuation
-                        if unsub_val:
-                            unsub_val += " " + line.strip()
+                    elif line.startswith((" ", "\t")) and unsub_val:
+                        unsub_val += " " + line.strip()
 
                 if not from_val:
                     continue
-
                 name, email_addr = _parse_from_str(from_val)
                 unsub            = _parse_unsub_str(unsub_val)
-
                 s = senders[email_addr]
                 s["name"]  = s["name"] or name
                 s["email"] = email_addr
@@ -200,48 +287,32 @@ def _imap_fetch_senders(mail: imaplib.IMAP4_SSL,
 
 
 def _imap_delete_unread(mail: imaplib.IMAP4_SSL,
-                         sender_emails: list,
+                         sender_emails: list[str],
                          account_email: str) -> int:
-    """Move all unread emails from sender_emails to Trash. Returns count moved."""
-    # Need write access for delete
     mail.select('"[Gmail]/All Mail"', readonly=False)
     total = 0
-
     for sender_email in sender_emails:
         try:
-            # Search unread from this sender
             typ, data = mail.uid(
                 "SEARCH", "CHARSET", "UTF-8",
                 "UNSEEN", "FROM", f'"{sender_email}"',
             )
             if typ != "OK" or not data or not data[0]:
                 continue
-
             uids = data[0].split()
-            if not uids:
-                continue
-
-            # Process in batches of 100
             for i in range(0, len(uids), 100):
                 batch   = uids[i : i + 100]
                 uid_str = ",".join(u.decode() for u in batch)
-
-                # Copy to Trash folder
-                mail.uid("COPY", uid_str, '"[Gmail]/Trash"')
-                # Mark deleted in All Mail so expunge removes it there too
+                mail.uid("COPY",  uid_str, '"[Gmail]/Trash"')
                 mail.uid("STORE", uid_str, "+FLAGS", "(\\Deleted)")
-                total += len(batch)
-
+                total  += len(batch)
             mail.expunge()
-
         except Exception as e:
             console.print(f"    [red]Error trashing mail from {sender_email}: {e}[/red]")
-
     return total
 
 
 def _imap_send_unsub(email: str, password: str, mailto_url: str) -> bool:
-    """Send an unsubscribe email via SMTP using the app password."""
     m = re.match(r"mailto:([^?]+)(?:\?(.*))?", mailto_url, re.I)
     if not m:
         return False
@@ -271,33 +342,32 @@ def _imap_send_unsub(email: str, password: str, mailto_url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OAuth helpers  (unchanged from v1)
+# OAuth
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _oauth_get_service():
     if not OAUTH_AVAILABLE:
-        console.print("[red]OAuth libraries not installed. Run: pip install google-auth google-auth-oauthlib google-api-python-client[/red]")
+        console.print("[red]OAuth libraries not installed.[/red]\n"
+                      "Run: pip install google-auth google-auth-oauthlib google-api-python-client")
         raise SystemExit(1)
     if not CREDS_FILE.exists():
         console.print(Panel(
             "[bold red]credentials.json not found![/bold red]\n\n"
-            "One-time setup (3 minutes):\n"
+            "One-time setup:\n"
             "1. https://console.cloud.google.com/ → create/select a project\n"
             "2. APIs & Services → Enable APIs → Gmail API → Enable\n"
             "3. Credentials → + Create Credentials → OAuth client ID\n"
-            "   (configure consent screen if prompted → External)\n"
+            "   (configure consent screen first if prompted → External)\n"
             "4. Application type: [bold]Desktop app[/bold] → Create → Download JSON\n"
-            "5. Rename to [bold]credentials.json[/bold] and place next to this script\n"
+            "5. Rename to [bold]credentials.json[/bold] → place next to this script\n"
             "6. OAuth consent screen → Test users → + Add Users → your Gmail",
             title="Setup Required", border_style="red",
         ))
         raise SystemExit(1)
-
     creds = None
     if TOKEN_FILE.exists():
         with open(TOKEN_FILE, "rb") as f:
             creds = pickle.load(f)
-
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
@@ -309,23 +379,21 @@ def _oauth_get_service():
             creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, "wb") as f:
             pickle.dump(creds, f)
-
     return _build("gmail", "v1", credentials=creds)
 
 
 def _oauth_fetch_senders(service, max_results: int, mode_key: str) -> dict:
-    _, search_term, folder, gm_raw = SCAN_MODES[mode_key]
-    query     = "is:unread" if search_term == "UNSEEN" else ""
+    _, search_flag, folder, gm_raw = SCAN_MODES[mode_key]
+    query     = "is:unread" if search_flag == "UNSEEN" else ""
     label_ids = None
     if folder == "INBOX":
         label_ids = ["INBOX"]
     if gm_raw == "category:promotions":
-        label_ids = ["CATEGORY_PROMOTIONS"]
-        query     = ""
+        label_ids, query = ["CATEGORY_PROMOTIONS"], ""
 
-    senders   = defaultdict(lambda: {"name":"","email":"","count":0,"unsubscribe":None,"account":"OAuth"})
-    page_tok  = None
-    fetched   = 0
+    senders  = defaultdict(lambda: {"name":"","email":"","count":0,"unsubscribe":None,"account":"OAuth"})
+    page_tok = None
+    fetched  = 0
 
     with Progress(SpinnerColumn(),
                   TextColumn("  [cyan]OAuth account[/cyan] scanning…"),
@@ -335,12 +403,9 @@ def _oauth_fetch_senders(service, max_results: int, mode_key: str) -> dict:
         while fetched < max_results:
             batch  = min(100, max_results - fetched)
             kwargs = dict(userId="me", maxResults=batch)
-            if query:
-                kwargs["q"] = query
-            if label_ids:
-                kwargs["labelIds"] = label_ids
-            if page_tok:
-                kwargs["pageToken"] = page_tok
+            if query:      kwargs["q"]         = query
+            if label_ids:  kwargs["labelIds"]  = label_ids
+            if page_tok:   kwargs["pageToken"] = page_tok
             res  = service.users().messages().list(**kwargs).execute()
             msgs = res.get("messages", [])
             if not msgs:
@@ -374,29 +439,24 @@ def _oauth_fetch_senders(service, max_results: int, mode_key: str) -> dict:
     return dict(senders)
 
 
-def _oauth_delete_unread(service, sender_emails: list) -> int:
+def _oauth_delete_unread(service, sender_emails: list[str]) -> int:
     total = 0
     for ea in sender_emails:
-        page_tok = None
-        ids = []
+        page_tok, ids = None, []
         while True:
             kwargs = dict(userId="me", q=f"from:{ea} is:unread", maxResults=500)
-            if page_tok:
-                kwargs["pageToken"] = page_tok
+            if page_tok: kwargs["pageToken"] = page_tok
             res = service.users().messages().list(**kwargs).execute()
             ids.extend(m["id"] for m in res.get("messages", []))
             page_tok = res.get("nextPageToken")
-            if not page_tok:
-                break
+            if not page_tok: break
         for i in range(0, len(ids), 1000):
-            chunk = ids[i : i + 1000]
             service.users().messages().batchModify(
                 userId="me",
-                body={"ids": chunk,
-                      "addLabelIds": ["TRASH"],
+                body={"ids": ids[i:i+1000], "addLabelIds": ["TRASH"],
                       "removeLabelIds": ["INBOX","UNREAD","CATEGORY_PROMOTIONS"]},
             ).execute()
-            total += len(chunk)
+            total += len(ids[i:i+1000])
     return total
 
 
@@ -409,13 +469,13 @@ def show_table(senders: dict, multi_account: bool = False):
         title=f"[bold]Unique Senders[/bold]  ({len(senders)} total)",
         header_style="bold cyan", show_lines=False,
     )
-    table.add_column("#",            style="dim",     width=4,  justify="right")
+    table.add_column("#",            style="dim",    width=4,  justify="right")
     if multi_account:
         table.add_column("Account",  style="magenta", max_width=24)
-    table.add_column("Display Name", style="white",   min_width=22, max_width=32)
-    table.add_column("Email",        style="cyan",    min_width=26, max_width=40)
-    table.add_column("Count",        style="yellow",  width=6,  justify="right")
-    table.add_column("Unsub Link",   style="green",   width=10, justify="center")
+    table.add_column("Display Name", style="white",  min_width=22, max_width=32)
+    table.add_column("Email",        style="cyan",   min_width=26, max_width=40)
+    table.add_column("Count",        style="yellow", width=6,  justify="right")
+    table.add_column("Unsub Link",   style="green",  width=10, justify="center")
 
     for i, s in enumerate(
         sorted(senders.values(), key=lambda x: x["count"], reverse=True), 1
@@ -433,35 +493,6 @@ def show_table(senders: dict, multi_account: bool = False):
     console.print(table)
 
 
-def choose_senders(senders: dict, multi_account: bool = False) -> list:
-    sorted_s  = sorted(senders.values(), key=lambda x: x["count"], reverse=True)
-    can_unsub = [s for s in sorted_s if s["unsubscribe"]]
-    no_link   = [s for s in sorted_s if not s["unsubscribe"]]
-
-    if no_link:
-        console.print(f"[yellow]{len(no_link)} sender(s) have no unsubscribe link (excluded).[/yellow]")
-    if not can_unsub:
-        console.print("[red]No senders with an unsubscribe link found.[/red]")
-        return []
-
-    choices = [
-        questionary.Choice(
-            title=(
-                (f"[{s['account'][:20]}]  " if multi_account else "")
-                + f"{(s['name'] or s['email'])[:30]:30}  "
-                + f"<{s['email'][:36]}>"
-                + f"  ({s['count']} emails)"
-            ),
-            value=s["email"],
-            checked=False,
-        )
-        for s in can_unsub
-    ]
-
-    console.print("\n[bold]Space[/bold]=toggle  [bold]A[/bold]=all/none  [bold]Enter[/bold]=confirm\n")
-    return questionary.checkbox("Select senders to UNSUBSCRIBE from:", choices=choices).ask() or []
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -473,87 +504,66 @@ def main():
         border_style="cyan",
     ))
 
-    # ── Step 1: Choose auth method ────────────────────────────────────────
-    method = questionary.select(
+    # ── Step 1: Auth method ───────────────────────────────────────────────
+    method_idx = ask_select(
         "How do you want to sign in to Gmail?",
-        choices=[
-            questionary.Choice(
-                "App Password  (enter email + password here — supports multiple accounts)",
-                value="imap",
-            ),
-            questionary.Choice(
-                "Google OAuth  (opens browser, uses credentials.json — single account)",
-                value="oauth",
-            ),
+        [
+            "App Password + IMAP  (enter email & password here — supports multiple accounts)",
+            "Google OAuth          (opens browser, uses credentials.json — single account)",
         ],
-    ).ask()
+        default=1,
+    )
+    method = "imap" if method_idx == 1 else "oauth"
 
-    if method is None:
-        return
-
-    # ── Step 2: Collect account credentials ──────────────────────────────
-    accounts = []   # list of {"email": ..., "password": ...}  (IMAP only)
-    service  = None  # OAuth only
+    # ── Step 2: Collect credentials ───────────────────────────────────────
+    accounts   = []   # [{"email": ..., "password": ...}]
+    service    = None
 
     if method == "imap":
-        num_str = questionary.select(
+        num_accounts = ask_select(
             "How many Gmail accounts do you want to scan?",
-            choices=["1", "2", "3", "4", "5"],
-        ).ask()
-        if num_str is None:
-            return
-        num_accounts = int(num_str)
+            ["1", "2", "3", "4", "5"],
+            default=1,
+        )
 
-        for i in range(1, num_accounts + 1):
-            console.print(f"\n[bold]Account {i} of {num_accounts}[/bold]")
-
-            email = questionary.text(
-                "Gmail address:",
-                validate=lambda v: "@" in v or "Enter a valid email",
-            ).ask()
-            if email is None:
-                return
-            email = email.strip()
-
-            console.print(
-                "[dim]App Password = 16-char code from "
-                "myaccount.google.com/apppasswords\n"
-                "Regular password works only if 2FA is OFF (not recommended)[/dim]"
+        for i in range(num_accounts):
+            console.print(f"\n[bold]── Account {i+1} of {num_accounts} ──[/bold]")
+            email = ask_text(
+                "Gmail address",
+                validate=lambda v: "@" in v and "." in v,
             )
-            password = questionary.password("Password or App Password:").ask()
-            if password is None:
-                return
+            console.print(
+                "[dim]App Password = 16-char code from myaccount.google.com/apppasswords\n"
+                "Regular password works only if 2-Step Verification is OFF[/dim]"
+            )
+            password = ask_password("Password or App Password")
 
-            # Test the connection before continuing
-            console.print(f"  [cyan]Testing connection…[/cyan]", end=" ")
+            console.print("  [cyan]Testing connection…[/cyan] ", end="")
             try:
-                test = _imap_connect(email, password.strip())
+                test = _imap_connect(email, password)
                 test.logout()
-                console.print("[green]✓[/green]")
-                accounts.append({"email": email, "password": password.strip()})
+                console.print("[green]✓ Connected[/green]")
+                accounts.append({"email": email, "password": password})
             except imaplib.IMAP4.error as e:
-                console.print(f"[red]✗ Failed[/red]")
+                console.print("[red]✗ Failed[/red]")
                 console.print(Panel(
                     f"[red]Could not sign in to {email}[/red]\n\n"
-                    "Common causes:\n"
-                    "• Wrong App Password — regenerate at myaccount.google.com/apppasswords\n"
-                    "• IMAP not enabled — Gmail → Settings → Forwarding and POP/IMAP → Enable IMAP\n"
-                    "• 2-Step Verification is OFF — required for App Passwords\n\n"
-                    f"[dim]Error: {e}[/dim]",
+                    "Common fixes:\n"
+                    "• Wrong App Password → regenerate at myaccount.google.com/apppasswords\n"
+                    "• IMAP not enabled → Gmail Settings → Forwarding and POP/IMAP → Enable IMAP\n"
+                    "• 2-Step Verification off → required for App Passwords\n\n"
+                    f"[dim]{e}[/dim]",
                     border_style="red",
                 ))
-                retry = questionary.confirm("Try a different password for this account?").ask()
-                if retry:
-                    password = questionary.password("Password or App Password:").ask()
-                    if password is None:
-                        return
+                if ask_confirm("Retry with a different password?"):
+                    password = ask_password("Password or App Password")
                     try:
-                        test = _imap_connect(email, password.strip())
+                        test = _imap_connect(email, password)
                         test.logout()
-                        console.print(f"  [green]✓ Connected[/green]")
-                        accounts.append({"email": email, "password": password.strip()})
+                        console.print("  [green]✓ Connected[/green]")
+                        accounts.append({"email": email, "password": password})
                     except Exception as e2:
-                        console.print(f"  [red]✗ Still failed: {e2} — skipping this account.[/red]")
+                        console.print(f"  [red]✗ Still failed ({e2}) — skipping.[/red]")
                 else:
                     console.print(f"  [yellow]Skipping {email}[/yellow]")
 
@@ -562,43 +572,26 @@ def main():
             return
 
     else:
-        # OAuth
-        console.print("\n[cyan]Connecting via OAuth…[/cyan]")
+        console.print("\n[cyan]Connecting via OAuth (browser will open)…[/cyan]")
         service = _oauth_get_service()
         console.print("[green]✓ Connected[/green]")
 
     # ── Step 3: Scan options ──────────────────────────────────────────────
-    mode_key = questionary.select(
-        "\nWhich emails should be scanned?",
-        choices=[
-            questionary.Choice(
-                "All unread emails  (recommended — catches mislabelled promos)",
-                value="all_unread",
-            ),
-            questionary.Choice(
-                "All emails — read + unread  (most thorough, slower)",
-                value="all_mail",
-            ),
-            questionary.Choice("Promotions folder only",  value="promos_only"),
-            questionary.Choice("Inbox only  (unread)",    value="inbox"),
-        ],
-        default="all_unread",
-    ).ask()
-    if mode_key is None:
-        return
+    mode_idx = ask_select(
+        "Which emails should be scanned?",
+        [label for label, *_ in SCAN_MODES.values()],
+        default=1,
+    )
+    mode_key = list(SCAN_MODES.keys())[mode_idx - 1]
 
-    raw = questionary.text(
-        f"How many emails to scan{'per account' if len(accounts) > 1 else ''}?",
-        default="1000",
-        validate=lambda v: v.isdigit() and int(v) > 0 or "Enter a positive number",
-    ).ask()
-    if raw is None:
-        return
-    max_results = int(raw)
+    per_label = "per account " if len(accounts) > 1 else ""
+    max_results = ask_int(f"How many emails to scan {per_label}(0 = unlimited)?", default=1000)
+    if max_results == 0:
+        max_results = 999_999
 
     # ── Step 4: Scan ──────────────────────────────────────────────────────
-    all_senders: dict = {}    # keyed by "email||account" to allow same sender in 2 accounts
-    imap_conns:  dict = {}    # account_email -> (imap_conn, password) for actions later
+    all_senders: dict = {}
+    imap_conns:  dict = {}   # email -> (mail_obj, password)
 
     if method == "imap":
         for acct in accounts:
@@ -607,72 +600,95 @@ def main():
                 mail = _imap_connect(acct["email"], acct["password"])
                 imap_conns[acct["email"]] = (mail, acct["password"])
                 senders = _imap_fetch_senders(mail, max_results, mode_key, acct["email"])
-                console.print(f"  [green]✓ {len(senders)} unique sender(s) found[/green]")
-                for email_addr, data in senders.items():
-                    key = f"{email_addr}||{acct['email']}"
-                    all_senders[key] = data
+                console.print(f"  [green]✓ {len(senders)} unique sender(s)[/green]")
+                for ea, data in senders.items():
+                    all_senders[f"{ea}||{acct['email']}"] = data
             except Exception as e:
                 console.print(f"  [red]Scan failed: {e}[/red]")
     else:
         senders = _oauth_fetch_senders(service, max_results, mode_key)
-        console.print(f"  [green]✓ {len(senders)} unique sender(s) found[/green]")
-        for email_addr, data in senders.items():
-            all_senders[f"{email_addr}||OAuth"] = data
+        console.print(f"  [green]✓ {len(senders)} unique sender(s)[/green]")
+        for ea, data in senders.items():
+            all_senders[f"{ea}||OAuth"] = data
 
     if not all_senders:
         console.print("[yellow]No senders found.[/yellow]")
         return
 
-    # Flatten for display: merge counts if same sender appears in 2+ accounts
+    # Flatten: merge counts from same sender across multiple accounts
     flat: dict = {}
     for key, data in all_senders.items():
-        sender_email = key.split("||")[0]
-        if sender_email not in flat:
-            flat[sender_email] = dict(data)
+        ea = key.split("||")[0]
+        if ea not in flat:
+            flat[ea] = dict(data)
         else:
-            flat[sender_email]["count"] += data["count"]
+            flat[ea]["count"] += data["count"]
 
     multi = len(accounts) > 1
-    console.print(f"\n[green]Found {len(flat)} unique sender(s)"
-                  + (f" across {len(accounts)} accounts" if multi else "")
-                  + ".[/green]\n")
+    console.print(
+        f"\n[green]Found {len(flat)} unique sender(s)"
+        + (f" across {len(accounts)} accounts" if multi else "")
+        + ".[/green]\n"
+    )
     show_table(flat, multi_account=multi)
 
-    # ── Step 5: Select senders ────────────────────────────────────────────
-    selected = choose_senders(flat, multi_account=multi)
-    if not selected:
+    # ── Step 5: Choose senders ────────────────────────────────────────────
+    sorted_s  = sorted(flat.values(), key=lambda x: x["count"], reverse=True)
+    can_unsub = [s for s in sorted_s if s["unsubscribe"]]
+    no_link   = [s for s in sorted_s if not s["unsubscribe"]]
+
+    if no_link:
+        console.print(f"[yellow]{len(no_link)} sender(s) have no unsubscribe link (excluded from list).[/yellow]")
+    if not can_unsub:
+        console.print("[red]No senders with an unsubscribe link found.[/red]")
+        return
+
+    options = [
+        (f"{(s['name'] or s['email'])[:30]:30}  <{s['email'][:38]}>  ({s['count']} emails)"
+         + (f"  [{s['account'][:20]}]" if multi else ""))
+        for s in can_unsub
+    ]
+    selected_indices = ask_checkbox(
+        f"Select senders to UNSUBSCRIBE from  ({len(can_unsub)} available):",
+        options,
+    )
+    if not selected_indices:
         console.print("\n[yellow]Nothing selected — bye![/yellow]")
         return
 
-    # ── Step 6: Actions ───────────────────────────────────────────────────
-    console.print(f"\n[bold]{len(selected)} sender(s) selected.[/bold]")
-    actions = questionary.checkbox(
-        "What do you want to do?",
-        choices=[
-            questionary.Choice("Unsubscribe  (send request / open browser)",
-                               value="unsub",   checked=True),
-            questionary.Choice("Delete their unread emails",
-                               value="delete",  checked=True),
-        ],
-    ).ask() or []
+    selected_senders = [can_unsub[i - 1] for i in selected_indices]
+    selected_emails  = [s["email"] for s in selected_senders]
 
-    if not actions:
+    # ── Step 6: Choose actions ────────────────────────────────────────────
+    console.print(f"\n[bold]{len(selected_emails)} sender(s) selected.[/bold]")
+    action_indices = ask_checkbox(
+        "What do you want to do?",
+        [
+            "Unsubscribe  (send request via email / open browser)",
+            "Delete their unread emails  (moves to Trash)",
+        ],
+    )
+    if not action_indices:
         console.print("[yellow]No actions chosen — bye![/yellow]")
         return
-    if not questionary.confirm("Proceed?").ask():
+
+    do_unsub   = 1 in action_indices
+    do_delete  = 2 in action_indices
+
+    if not ask_confirm(f"Proceed with {len(selected_emails)} sender(s)?"):
         console.print("[yellow]Cancelled.[/yellow]")
         return
 
-    # ── Step 7: Execute ───────────────────────────────────────────────────
-    if "unsub" in actions:
-        console.print(f"\n[bold cyan]Unsubscribing from {len(selected)} sender(s)…[/bold cyan]\n")
+    # ── Step 7: Unsubscribe ───────────────────────────────────────────────
+    if do_unsub:
+        console.print(f"\n[bold cyan]Unsubscribing from {len(selected_emails)} sender(s)…[/bold cyan]\n")
         ok_mail, ok_web, failed = [], [], []
 
-        for sender_email in selected:
-            data  = flat[sender_email]
-            unsub = data["unsubscribe"]
-            acct  = data.get("account", "")
-            console.print(f"  [white]{data['name'] or sender_email} <{sender_email}>[/white]"
+        for s in selected_senders:
+            ea    = s["email"]
+            unsub = s["unsubscribe"]
+            acct  = s.get("account", "")
+            console.print(f"  [white]{s['name'] or ea} <{ea}>[/white]"
                           + (f"  [dim]({acct})[/dim]" if multi else ""))
 
             sent = False
@@ -682,9 +698,9 @@ def main():
                     sent = _imap_send_unsub(acct, pwd, unsub["mailto"])
                 elif method == "oauth" and service:
                     try:
-                        m2    = re.match(r"mailto:([^?]+)(?:\?(.*))?", unsub["mailto"], re.I)
-                        to_a  = m2.group(1).strip()
-                        prms  = {}
+                        m2   = re.match(r"mailto:([^?]+)(?:\?(.*))?", unsub["mailto"], re.I)
+                        to_a = m2.group(1).strip()
+                        prms = {}
                         if m2.group(2):
                             for kv in m2.group(2).split("&"):
                                 if "=" in kv:
@@ -699,18 +715,18 @@ def main():
                         ).execute()
                         sent = True
                     except Exception as e:
-                        console.print(f"    [red]OAuth send error: {e}[/red]")
+                        console.print(f"    [red]Error: {e}[/red]")
 
             if sent:
                 console.print("    [green]✓ Unsubscribe email sent[/green]")
-                ok_mail.append(sender_email)
+                ok_mail.append(ea)
             elif unsub and unsub.get("http"):
                 webbrowser.open(unsub["http"])
                 console.print("    [yellow]↗ Unsubscribe page opened in browser[/yellow]")
-                ok_web.append(sender_email)
+                ok_web.append(ea)
             else:
                 console.print("    [red]✗ No usable unsubscribe method[/red]")
-                failed.append(sender_email)
+                failed.append(ea)
 
         console.print(
             f"\n[bold]Unsubscribe results:[/bold]\n"
@@ -719,36 +735,35 @@ def main():
             f"  [red]Failed         : {len(failed)}[/red]"
         )
 
-    if "delete" in actions:
-        console.print(f"\n[bold cyan]Deleting unread emails from {len(selected)} sender(s)…[/bold cyan]")
+    # ── Step 8: Delete ────────────────────────────────────────────────────
+    if do_delete:
+        console.print(f"\n[bold cyan]Deleting unread emails from {len(selected_emails)} sender(s)…[/bold cyan]")
+        total_deleted = 0
 
         if method == "imap":
-            # Group selected senders by account
             by_account: dict = defaultdict(list)
-            for sender_email in selected:
-                acct = flat[sender_email].get("account", "")
-                by_account[acct].append(sender_email)
+            for s in selected_senders:
+                by_account[s.get("account","")].append(s["email"])
 
-            total_deleted = 0
-            for acct_email, sender_list in by_account.items():
+            for acct_email, email_list in by_account.items():
                 if acct_email not in imap_conns:
                     continue
                 mail, _ = imap_conns[acct_email]
-                console.print(f"\n  [magenta]{acct_email}[/magenta]  ({len(sender_list)} sender(s))")
+                console.print(f"\n  [magenta]{acct_email}[/magenta]  ({len(email_list)} sender(s))…")
                 with Progress(SpinnerColumn(), TextColumn("  Moving to Trash…"),
                               console=console, transient=True) as p:
                     p.add_task("", total=None)
-                    n = _imap_delete_unread(mail, sender_list, acct_email)
+                    n = _imap_delete_unread(mail, email_list, acct_email)
                 console.print(f"  [green]✓ {n} email(s) moved to Trash[/green]")
                 total_deleted += n
         else:
             with Progress(SpinnerColumn(), TextColumn("  Moving to Trash…"),
                           console=console, transient=True) as p:
                 p.add_task("", total=None)
-                total_deleted = _oauth_delete_unread(service, selected)
+                total_deleted = _oauth_delete_unread(service, selected_emails)
             console.print(f"  [green]✓ {total_deleted} email(s) moved to Trash[/green]")
 
-        console.print("[dim]  Trash auto-empties after 30 days, or empty it manually in Gmail.[/dim]")
+        console.print("[dim]  Trash auto-empties after 30 days.[/dim]")
 
     # ── Cleanup ───────────────────────────────────────────────────────────
     for mail, _ in imap_conns.values():
@@ -757,7 +772,8 @@ def main():
         except Exception:
             pass
 
-    console.print("\n[bold green]All done! 🎉[/bold green]")
+    console.print("\n[bold green]All done![/bold green]")
+    input("\nPress Enter to close…")
 
 
 if __name__ == "__main__":

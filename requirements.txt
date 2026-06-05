@@ -1,9 +1,8 @@
-# Always required
-questionary>=2.0
+# Required — UI and display
 rich>=13.0
 
-# Only required for Google OAuth method (credentials.json flow)
-# If you use App Password + IMAP, you do NOT need these
+# Required only for Google OAuth method (credentials.json)
+# NOT needed if you use App Password + IMAP
 google-auth>=2.0
 google-auth-oauthlib>=1.0
 google-api-python-client>=2.0
