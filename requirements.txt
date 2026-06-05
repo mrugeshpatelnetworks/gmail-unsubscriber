@@ -1,8 +1,8 @@
-# Required — UI and display
-rich>=13.0
+# GUI — required
+PySide6>=6.5
 
-# Required only for Google OAuth method (credentials.json)
-# NOT needed if you use App Password + IMAP
+# Google OAuth — only needed for the OAuth sign-in option
+# Skip if using IMAP + App Password
 google-auth>=2.0
 google-auth-oauthlib>=1.0
 google-api-python-client>=2.0
