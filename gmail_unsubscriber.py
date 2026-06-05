@@ -11,6 +11,7 @@ Uses plain input() prompts — works in every terminal (cmd, PowerShell,
 Windows Terminal, VS Code, Mac/Linux).
 """
 
+import os
 import re
 import base64
 import imaplib
@@ -22,6 +23,7 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 from email.mime.text import MIMEText
+from email.header import decode_header as _mime_decode_header
 
 from rich.console import Console
 from rich.table import Table
@@ -91,39 +93,107 @@ def ask_select(title: str, options: list[str], default: int = 1) -> int:
         console.print(f"[red]Please enter a number between 1 and {len(options)}.[/red]")
 
 
-def ask_checkbox(title: str, options: list[str]) -> list[int]:
+def ask_multiselect(title: str, options: list[str]) -> list[int]:
     """
-    Checkbox menu — toggle by number, 'a' = all, Enter = confirm.
-    Returns list of selected 1-based indices.
+    Range-based multi-select — practical for lists of any size.
+    Accepts numbers, ranges (1-50), combinations, 'all', 'none'.
+    Returns sorted list of selected 1-based indices.
     """
-    selected: set[int] = set()
+    n = len(options)
+    console.print(f"\n[bold]{title}[/bold]  [dim]({n} senders with unsubscribe link)[/dim]\n")
+
+    console.print(
+        "  [dim]How to select:\n"
+        "    1-10        → senders 1 through 10\n"
+        "    1 3 5       → specific numbers\n"
+        "    1-50 75 90  → mix of ranges and numbers\n"
+        "    all         → select every sender\n"
+        "    none / q    → cancel[/dim]\n"
+    )
 
     while True:
-        console.print(f"\n[bold]{title}[/bold]")
-        for i, opt in enumerate(options, 1):
-            mark = "[green]✓[/green]" if i in selected else "[ ]"
-            console.print(f"  {mark} [cyan]{i}[/cyan])  {opt}")
-        console.print(
-            "\n  [dim]Type a number to toggle · [bold]a[/bold] = select all / "
-            "deselect all · [bold]Enter[/bold] = confirm · [bold]q[/bold] = quit[/dim]"
-        )
         try:
-            raw = input("  > ").strip().lower()
+            raw = input("  Select > ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[yellow]Cancelled.[/yellow]")
             sys.exit(0)
 
-        if raw in ("", "done"):
-            return sorted(selected)
-        if raw == "q":
+        if raw in ("none", "q", ""):
             return []
-        if raw == "a":
-            selected = set(range(1, len(options) + 1)) if len(selected) < len(options) else set()
-        elif raw.isdigit() and 1 <= int(raw) <= len(options):
-            n = int(raw)
-            selected.discard(n) if n in selected else selected.add(n)
-        else:
-            console.print(f"[red]Invalid input.[/red]")
+        if raw == "all":
+            console.print(f"  [green]Selected all {n} sender(s).[/green]")
+            return list(range(1, n + 1))
+
+        selected: set[int] = set()
+        error = False
+        for part in raw.replace(",", " ").split():
+            if "-" in part:
+                a, _, b = part.partition("-")
+                if a.isdigit() and b.isdigit():
+                    lo, hi = int(a), int(b)
+                    if 1 <= lo <= n and 1 <= hi <= n and lo <= hi:
+                        selected.update(range(lo, hi + 1))
+                    else:
+                        console.print(f"  [red]Range {part} out of bounds (1–{n})[/red]")
+                        error = True; break
+                else:
+                    console.print(f"  [red]Invalid range: '{part}'[/red]")
+                    error = True; break
+            elif part.isdigit():
+                num = int(part)
+                if 1 <= num <= n:
+                    selected.add(num)
+                else:
+                    console.print(f"  [red]{num} is out of bounds (1–{n})[/red]")
+                    error = True; break
+            else:
+                console.print(f"  [red]Unknown input: '{part}'[/red]")
+                error = True; break
+
+        if error:
+            continue
+        if not selected:
+            console.print("  [yellow]Nothing matched.[/yellow]")
+            continue
+
+        # Preview selection before confirming
+        sorted_sel = sorted(selected)
+        names = [options[i - 1].split("<")[0].strip()[:22] for i in sorted_sel[:6]]
+        more  = f" +{len(sorted_sel) - 6} more" if len(sorted_sel) > 6 else ""
+        console.print(f"\n  [green]{len(sorted_sel)} selected:[/green] {', '.join(names)}{more}")
+        try:
+            confirm = input("  Confirm? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            sys.exit(0)
+        if confirm in ("", "y", "yes"):
+            return sorted_sel
+        # else loop back to re-enter
+
+
+def ask_actions(selected_count: int) -> tuple[bool, bool]:
+    """
+    Simple action picker for unsubscribe / delete.
+    Returns (do_unsub, do_delete).
+    """
+    console.print(f"\n[bold]{selected_count} sender(s) selected. What do you want to do?[/bold]")
+    console.print("  [cyan]1[/cyan])  Unsubscribe only")
+    console.print("  [cyan]2[/cyan])  Delete unread emails only")
+    console.print("  [cyan]3[/cyan])  Both  (default)")
+    console.print("  [cyan]q[/cyan])  Cancel")
+    while True:
+        try:
+            raw = input("\n  Choice [3]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            sys.exit(0)
+        if raw in ("", "3", "both"):
+            return True, True
+        if raw == "1":
+            return True, False
+        if raw == "2":
+            return False, True
+        if raw == "q":
+            return False, False
+        console.print("  [red]Enter 1, 2, 3, or q.[/red]")
 
 
 def ask_confirm(title: str, default: bool = True) -> bool:
@@ -167,10 +237,100 @@ def ask_password(title: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Env-var password lookup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_env_password(email: str) -> str | None:
+    """
+    Check environment variables for a saved App Password for this email.
+    Supports three naming conventions:
+      GMAIL_EMAIL / GMAIL_APP_PASSWORD          (single account)
+      GMAIL_EMAIL_1 / GMAIL_APP_PASSWORD_1 ...  (numbered)
+      GMAIL_ACCOUNTS=email:pass,email:pass       (comma-separated)
+    """
+    email_lower = email.strip().lower()
+
+    # Convention 1 — single
+    if os.environ.get("GMAIL_EMAIL", "").strip().lower() == email_lower:
+        pwd = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+        if pwd:
+            return pwd
+
+    # Convention 2 — numbered
+    for i in range(1, 11):
+        if os.environ.get(f"GMAIL_EMAIL_{i}", "").strip().lower() == email_lower:
+            pwd = os.environ.get(f"GMAIL_APP_PASSWORD_{i}", "").strip()
+            if pwd:
+                return pwd
+
+    # Convention 3 — GMAIL_ACCOUNTS=email:pass,email:pass
+    for entry in os.environ.get("GMAIL_ACCOUNTS", "").split(","):
+        entry = entry.strip()
+        if ":" in entry:
+            e, _, p = entry.partition(":")
+            if e.strip().lower() == email_lower and p.strip():
+                return p.strip()
+
+    return None
+
+
+def _detect_env_accounts() -> list[dict]:
+    """Return list of {email, password} dicts found in environment variables."""
+    accounts = []
+    seen = set()
+
+    def _add(email, pwd):
+        e = email.strip().lower()
+        if e and pwd.strip() and e not in seen:
+            seen.add(e)
+            accounts.append({"email": email.strip(), "password": pwd.strip()})
+
+    # Single
+    e = os.environ.get("GMAIL_EMAIL", "")
+    p = os.environ.get("GMAIL_APP_PASSWORD", "")
+    if e and p:
+        _add(e, p)
+
+    # Numbered
+    for i in range(1, 11):
+        e = os.environ.get(f"GMAIL_EMAIL_{i}", "")
+        p = os.environ.get(f"GMAIL_APP_PASSWORD_{i}", "")
+        if e and p:
+            _add(e, p)
+
+    # Comma-separated
+    for entry in os.environ.get("GMAIL_ACCOUNTS", "").split(","):
+        entry = entry.strip()
+        if ":" in entry:
+            e, _, p = entry.partition(":")
+            if e and p:
+                _add(e, p)
+
+    return accounts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Email parsing helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _decode_mime(s: str) -> str:
+    """Decode MIME encoded-word strings like =?UTF-8?Q?Groupon_Flash?= into plain text."""
+    try:
+        parts = _mime_decode_header(s)
+        out = []
+        for chunk, charset in parts:
+            if isinstance(chunk, bytes):
+                out.append(chunk.decode(charset or "utf-8", errors="replace"))
+            else:
+                out.append(chunk)
+        return "".join(out).strip()
+    except Exception:
+        return s
+
+
 def _parse_from_str(value: str) -> tuple[str, str]:
+    # Decode any MIME-encoded name first
+    value = _decode_mime(value)
     m = re.match(r'^"?([^"<]*)"?\s*<([^>]+)>', value.strip())
     if m:
         return m.group(1).strip(), m.group(2).strip().lower()
@@ -520,52 +680,96 @@ def main():
     service    = None
 
     if method == "imap":
-        num_accounts = ask_select(
-            "How many Gmail accounts do you want to scan?",
-            ["1", "2", "3", "4", "5"],
-            default=1,
-        )
-
-        for i in range(num_accounts):
-            console.print(f"\n[bold]── Account {i+1} of {num_accounts} ──[/bold]")
-            email = ask_text(
-                "Gmail address",
-                validate=lambda v: "@" in v and "." in v,
-            )
+        # ── Check env vars first ──────────────────────────────────────────
+        env_accounts = _detect_env_accounts()
+        if env_accounts:
             console.print(
-                "[dim]App Password = 16-char code from myaccount.google.com/apppasswords\n"
-                "Regular password works only if 2-Step Verification is OFF[/dim]"
+                f"\n[green]✓ Found {len(env_accounts)} account(s) in environment variables:[/green]"
             )
-            password = ask_password("Password or App Password")
-
-            console.print("  [cyan]Testing connection…[/cyan] ", end="")
-            try:
-                test = _imap_connect(email, password)
-                test.logout()
-                console.print("[green]✓ Connected[/green]")
-                accounts.append({"email": email, "password": password})
-            except imaplib.IMAP4.error as e:
-                console.print("[red]✗ Failed[/red]")
-                console.print(Panel(
-                    f"[red]Could not sign in to {email}[/red]\n\n"
-                    "Common fixes:\n"
-                    "• Wrong App Password → regenerate at myaccount.google.com/apppasswords\n"
-                    "• IMAP not enabled → Gmail Settings → Forwarding and POP/IMAP → Enable IMAP\n"
-                    "• 2-Step Verification off → required for App Passwords\n\n"
-                    f"[dim]{e}[/dim]",
-                    border_style="red",
-                ))
-                if ask_confirm("Retry with a different password?"):
-                    password = ask_password("Password or App Password")
+            for a in env_accounts:
+                console.print(f"    • {a['email']}")
+            use_env = ask_select(
+                "Use saved credentials?",
+                [
+                    "Yes — use environment variable credentials",
+                    "No  — enter credentials manually",
+                ],
+                default=1,
+            )
+            if use_env == 1:
+                accounts = env_accounts
+                # Validate each env-var account
+                validated = []
+                for acct in accounts:
+                    console.print(f"  [cyan]Testing {acct['email']}…[/cyan] ", end="")
                     try:
-                        test = _imap_connect(email, password)
+                        test = _imap_connect(acct["email"], acct["password"])
                         test.logout()
-                        console.print("  [green]✓ Connected[/green]")
-                        accounts.append({"email": email, "password": password})
-                    except Exception as e2:
-                        console.print(f"  [red]✗ Still failed ({e2}) — skipping.[/red]")
+                        console.print("[green]✓[/green]")
+                        validated.append(acct)
+                    except Exception as e:
+                        console.print(f"[red]✗ {e}[/red]")
+                accounts = validated
+                if not accounts:
+                    console.print("[red]No env-var accounts connected — falling back to manual entry.[/red]")
+                    env_accounts = []   # fall through to manual
+
+        if not accounts:
+            # ── Manual entry ──────────────────────────────────────────────
+            num_accounts = ask_select(
+                "How many Gmail accounts do you want to scan?",
+                ["1", "2", "3", "4", "5"],
+                default=1,
+            )
+
+            for i in range(num_accounts):
+                console.print(f"\n[bold]── Account {i+1} of {num_accounts} ──[/bold]")
+                email = ask_text(
+                    "Gmail address",
+                    validate=lambda v: "@" in v and "." in v,
+                )
+
+                # Check if env var has a password for this email
+                env_pwd = _find_env_password(email)
+                if env_pwd:
+                    console.print(f"  [green]✓ App Password found in environment variables[/green]")
+                    password = env_pwd
                 else:
-                    console.print(f"  [yellow]Skipping {email}[/yellow]")
+                    console.print(
+                        "  [dim]Tip: App Password = 16-char code from "
+                        "myaccount.google.com/apppasswords[/dim]"
+                    )
+                    password = ask_password("  Password or App Password")
+
+                console.print("  [cyan]Testing connection…[/cyan] ", end="")
+                try:
+                    test = _imap_connect(email, password)
+                    test.logout()
+                    console.print("[green]✓ Connected[/green]")
+                    accounts.append({"email": email, "password": password})
+                except imaplib.IMAP4.error as e:
+                    console.print("[red]✗ Failed[/red]")
+                    console.print(Panel(
+                        f"[red]Could not sign in to {email}[/red]\n\n"
+                        "Common fixes:\n"
+                        "• Wrong App Password → regenerate at myaccount.google.com/apppasswords\n"
+                        "• IMAP not enabled → Gmail Settings → "
+                        "Forwarding and POP/IMAP → Enable IMAP\n"
+                        "• 2-Step Verification off → required for App Passwords\n\n"
+                        f"[dim]{e}[/dim]",
+                        border_style="red",
+                    ))
+                    if ask_confirm("  Retry with a different password?"):
+                        password = ask_password("  Password or App Password")
+                        try:
+                            test = _imap_connect(email, password)
+                            test.logout()
+                            console.print("  [green]✓ Connected[/green]")
+                            accounts.append({"email": email, "password": password})
+                        except Exception as e2:
+                            console.print(f"  [red]✗ Still failed ({e2}) — skipping.[/red]")
+                    else:
+                        console.print(f"  [yellow]Skipping {email}[/yellow]")
 
         if not accounts:
             console.print("[red]No accounts connected — exiting.[/red]")
@@ -644,12 +848,12 @@ def main():
         return
 
     options = [
-        (f"{(s['name'] or s['email'])[:30]:30}  <{s['email'][:38]}>  ({s['count']} emails)"
-         + (f"  [{s['account'][:20]}]" if multi else ""))
+        f"{(s['name'] or s['email'])[:30]:30}  <{s['email'][:38]}>  ({s['count']} emails)"
+        + (f"  [{s['account'][:20]}]" if multi else "")
         for s in can_unsub
     ]
-    selected_indices = ask_checkbox(
-        f"Select senders to UNSUBSCRIBE from  ({len(can_unsub)} available):",
+    selected_indices = ask_multiselect(
+        "Select senders to UNSUBSCRIBE from:",
         options,
     )
     if not selected_indices:
@@ -660,20 +864,10 @@ def main():
     selected_emails  = [s["email"] for s in selected_senders]
 
     # ── Step 6: Choose actions ────────────────────────────────────────────
-    console.print(f"\n[bold]{len(selected_emails)} sender(s) selected.[/bold]")
-    action_indices = ask_checkbox(
-        "What do you want to do?",
-        [
-            "Unsubscribe  (send request via email / open browser)",
-            "Delete their unread emails  (moves to Trash)",
-        ],
-    )
-    if not action_indices:
-        console.print("[yellow]No actions chosen — bye![/yellow]")
+    do_unsub, do_delete = ask_actions(len(selected_emails))
+    if not do_unsub and not do_delete:
+        console.print("[yellow]Cancelled.[/yellow]")
         return
-
-    do_unsub   = 1 in action_indices
-    do_delete  = 2 in action_indices
 
     if not ask_confirm(f"Proceed with {len(selected_emails)} sender(s)?"):
         console.print("[yellow]Cancelled.[/yellow]")
