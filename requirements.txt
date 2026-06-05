@@ -1,10 +1,5 @@
-# Core UI — required
+google-auth>=2.0
+google-auth-oauthlib>=1.0
+google-api-python-client>=2.0
 questionary>=2.0
 rich>=13.0
-
-# OAuth / Gmail API — only needed if NOT using App Password + IMAP
-# If you're using env vars (GMAIL_APP_PASSWORD), you can skip these.
-# If you want OAuth (credentials.json flow), uncomment:
-# google-auth>=2.0
-# google-auth-oauthlib>=1.0
-# google-api-python-client>=2.0

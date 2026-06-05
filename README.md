@@ -1,273 +1,261 @@
 # Gmail Unsubscriber
 
-A privacy-first command-line tool that scans **multiple Gmail accounts**, finds every unique sender across all of them, and lets you **unsubscribe and bulk-delete** unread emails — all from one checklist.
+A privacy-first command-line tool that scans your Gmail for promotional and newsletter emails, shows you a checklist of every unique sender, and lets you **unsubscribe and delete** in one go — including emails Gmail mislabelled and never put in the Promotions folder.
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│   Gmail Unsubscriber  ·  Multi-Account Edition           │
-│   Scan · Select · Unsubscribe · Delete                   │
-└──────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│       Gmail Promotional Email Unsubscriber  │
+│           Scan · Select · Unsubscribe       │
+└─────────────────────────────────────────────┘
 
-✓ 2 accounts detected.
+Which emails should be scanned for senders?
+❯ All unread emails  (catches promos Gmail missed)
+  All emails — read + unread  (most thorough)
+  Promotions folder only
+  Inbox only (unread)
 
-Which accounts should be scanned?
-  ✓  you@gmail.com        [IMAP]
-  ✓  other@gmail.com      [IMAP]
-
-Scanning you@gmail.com…       ████████████  1000/1000
-Scanning other@gmail.com…     ████████████  1000/1000
-
-Total: 184 unique sender(s) across 2 account(s).
-
-  #   Account              Display Name         Email                   Count  Unsub
-  1   you@gmail.com        Shopify              no-reply@shopify.com      47    yes
-  2   other@gmail.com      LinkedIn             messages@linkedin.com     31    yes
-  3   you@gmail.com        Newsletter Co        hello@newsletter.co       18    yes
+  #   Display Name             Email                          Count   Unsub Link
+  1   Shopify                  no-reply@shopify.com             47      yes
+  2   LinkedIn                 messages-noreply@linkedin.com    31      yes
+  3   Newsletter Co            hello@newsletter.co              18      yes
   ...
 
 Select senders to UNSUBSCRIBE from:
-  [ ] Shopify  (47 emails)
-  ✓   LinkedIn  (31 emails)
-  ✓   Newsletter Co  (18 emails)
+  [ ] Shopify <no-reply@shopify.com>  (47 emails)
+  [ ] LinkedIn <messages-noreply@linkedin.com>  (31 emails)
+  ✓   Newsletter Co <hello@newsletter.co>  (18 emails)
 ```
 
 ---
 
 ## Features
 
-| Feature | Details |
-|---|---|
-| **Multi-account** | Scan 2, 5, or 10 Gmail accounts in one run |
-| **Env var auth** | Reads App Passwords from environment variables — no Google Console setup per account |
-| **OAuth fallback** | Still supports `credentials.json` if you already set that up |
-| **All unread** | Scans your full inbox, not just the Promotions folder |
-| **Privacy-first** | Only reads `From` and `List-Unsubscribe` headers — email body is never touched |
-| **Auto-unsubscribe** | Sends unsubscribe emails via `List-Unsubscribe: <mailto:…>` automatically |
-| **Browser fallback** | Opens HTTP unsubscribe links in your browser |
-| **Bulk delete** | Moves all unread emails from selected senders to Trash |
-| **Cross-platform** | Windows, Mac, Linux |
+- **Scans all unread email** — not just the Promotions folder, so nothing is missed
+- **Privacy-preserving** — only reads email headers (From, List-Unsubscribe), never the body
+- **Automatic unsubscribe** — sends unsubscribe emails via `List-Unsubscribe` header automatically
+- **Browser fallback** — opens HTTP unsubscribe links in your browser when mailto: isn't available
+- **Bulk delete** — moves all unread emails from selected senders to Trash in one batch operation
+- **Four scan modes** — all unread, all mail, promotions only, or inbox only
+- **Works on Windows, Mac, and Linux**
 
 ---
 
 ## Requirements
 
 - Python 3.9 or higher
-- Gmail with **2-Step Verification** enabled (needed for App Passwords)
+- A Google account (Gmail)
+- 3 minutes for one-time Google API setup
 
 ---
 
-## Setup
+## Step 1 — Download the code
 
-### Method A — App Password + Environment Variables *(recommended, easiest for multiple accounts)*
-
-No Google Cloud Console setup needed. Works with any number of Gmail accounts.
-
-#### Step 1 — Generate an App Password for each Gmail account
-
-For **each** Gmail account you want to scan:
-
-1. Go to [myaccount.google.com/security](https://myaccount.google.com/security)
-2. Make sure **2-Step Verification** is turned ON (required)
-3. In the search bar type **"App passwords"** and open it
-   *(or go to [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords))*
-4. Click **Create** → give it a name (e.g. "Gmail Unsubscriber") → **Create**
-5. Copy the **16-character password** shown (with or without spaces)
-
-#### Step 2 — Enable IMAP in Gmail
-
-For **each** Gmail account:
-
-1. Open Gmail → click the gear icon → **See all settings**
-2. Go to the **Forwarding and POP/IMAP** tab
-3. Under **IMAP access** → select **Enable IMAP**
-4. Click **Save Changes**
-
-#### Step 3 — Set environment variables
-
-**Windows** (Command Prompt, permanent):
-```cmd
-setx GMAIL_EMAIL_1 "you@gmail.com"
-setx GMAIL_APP_PASSWORD_1 "abcd efgh ijkl mnop"
-setx GMAIL_EMAIL_2 "other@gmail.com"
-setx GMAIL_APP_PASSWORD_2 "qrst uvwx yz12 3456"
-```
-> After `setx`, close and reopen your terminal for the variables to take effect.
-
-**Windows** (PowerShell, permanent):
-```powershell
-[System.Environment]::SetEnvironmentVariable("GMAIL_EMAIL_1", "you@gmail.com", "User")
-[System.Environment]::SetEnvironmentVariable("GMAIL_APP_PASSWORD_1", "abcd efgh ijkl mnop", "User")
-[System.Environment]::SetEnvironmentVariable("GMAIL_EMAIL_2", "other@gmail.com", "User")
-[System.Environment]::SetEnvironmentVariable("GMAIL_APP_PASSWORD_2", "qrst uvwx yz12 3456", "User")
-```
-
-**Mac / Linux** (add to `~/.zshrc` or `~/.bashrc`):
+**Option A — Clone with Git**
 ```bash
-export GMAIL_EMAIL_1="you@gmail.com"
-export GMAIL_APP_PASSWORD_1="abcd efgh ijkl mnop"
-export GMAIL_EMAIL_2="other@gmail.com"
-export GMAIL_APP_PASSWORD_2="qrst uvwx yz12 3456"
+git clone https://github.com/YOUR_USERNAME/gmail-unsubscriber.git
+cd gmail-unsubscriber
 ```
-Then run `source ~/.zshrc` (or open a new terminal).
 
-#### Naming conventions supported
-
-All three formats work — use whichever fits your setup:
-
-```bash
-# Format 1 — numbered (recommended for multiple accounts)
-GMAIL_EMAIL_1=you@gmail.com
-GMAIL_APP_PASSWORD_1=xxxx xxxx xxxx xxxx
-GMAIL_EMAIL_2=other@gmail.com
-GMAIL_APP_PASSWORD_2=yyyy yyyy yyyy yyyy
-
-# Format 2 — single (one account only)
-GMAIL_EMAIL=you@gmail.com
-GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx
-
-# Format 3 — comma-separated string
-GMAIL_ACCOUNTS=you@gmail.com:xxxx xxxx xxxx xxxx,other@gmail.com:yyyy yyyy yyyy yyyy
-```
+**Option B — Download ZIP**
+1. Click the green **Code** button at the top of this page
+2. Click **Download ZIP**
+3. Unzip the folder and open a terminal inside it
 
 ---
 
-### Method B — OAuth / Gmail API *(alternative, one-time Google Console setup)*
+## Step 2 — Set up Gmail API access (one time only)
 
-Use this only if you can't use App Passwords (e.g. a Google Workspace account with restrictions).
+This tool uses Google's official Gmail API. You need to create your own API credentials — this keeps your data completely private (no third-party servers involved).
 
-#### Step 1 — Create a Google Cloud project
+> **This takes about 3 minutes the first time. You never need to do it again.**
 
-1. Go to [console.cloud.google.com](https://console.cloud.google.com/)
-2. Create or select a project
-3. **APIs & Services → Enable APIs** → search **Gmail API** → Enable
+### 2a. Create a Google Cloud project
 
-#### Step 2 — Create OAuth credentials
+1. Go to [https://console.cloud.google.com/](https://console.cloud.google.com/)
+2. Click the project dropdown at the top → **New Project**
+3. Give it any name (e.g. `gmail-unsubscriber`) → **Create**
+4. Make sure the new project is selected in the dropdown
 
-1. **APIs & Services → Credentials → + Create Credentials → OAuth client ID**
-2. If prompted, configure the consent screen first:
-   - External → fill in App name + your email → Save and Continue through all steps
-3. Application type: **Desktop app** → Create
-4. **Download JSON** → rename to `credentials.json` → place in the project folder
+### 2b. Enable the Gmail API
 
-#### Step 3 — Add yourself as a test user
+1. In the left menu go to **APIs & Services → Library**
+2. Search for **Gmail API**
+3. Click it → click **Enable**
 
-1. **APIs & Services → OAuth consent screen → Test users → + Add Users**
-2. Add your Gmail address
+### 2c. Create OAuth credentials
 
-> For multiple OAuth accounts, save each credentials file as `credentials_account1.json`, `credentials_account2.json`, etc.
+1. Go to **APIs & Services → Credentials**
+2. Click **+ Create Credentials → OAuth client ID**
+3. If prompted to configure the consent screen first:
+   - Click **Configure Consent Screen**
+   - Choose **External** → **Create**
+   - Fill in **App name** (any name), **User support email** (your Gmail), **Developer contact email** (your Gmail)
+   - Click **Save and Continue** through all steps (you can leave everything else blank)
+   - Click **Back to Dashboard**
+   - Go back to **Credentials → + Create Credentials → OAuth client ID**
+4. For **Application type** choose **Desktop app**
+5. Give it any name → **Create**
+6. Click **Download JSON** on the confirmation dialog
+7. Rename the downloaded file to exactly **`credentials.json`**
+8. Move it into the `gmail-unsubscriber` folder (same folder as `gmail_unsubscriber.py`)
+
+### 2d. Add yourself as a test user
+
+Because this app is in "Testing" mode, only explicitly added users can sign in.
+
+1. Go to **APIs & Services → OAuth consent screen**
+2. Scroll down to **Test users** → click **+ Add Users**
+3. Enter your Gmail address → **Save**
+
+> **Note:** You only need to add yourself. This is a local tool — no one else signs in.
 
 ---
 
-## Installation & running
+## Step 3 — Install and run
 
 ### Windows
+
+Double-click **`setup.bat`** — it installs dependencies and launches the tool automatically.
+
+Or in a terminal:
 ```cmd
 pip install -r requirements.txt
 python gmail_unsubscriber.py
 ```
-Or double-click **`setup.bat`**.
 
 ### Mac / Linux
+
 ```bash
-chmod +x setup.sh && ./setup.sh
+chmod +x setup.sh
+./setup.sh
 ```
+
 Or manually:
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python gmail_unsubscriber.py
 ```
 
+### First run
+
+A browser window will open asking you to sign into your Google account. Grant the requested permissions and return to the terminal. The tool will start scanning immediately.
+
+Your login is saved to `token.pickle` so you won't need to sign in again.
+
 ---
 
-## How to use
+## Step 4 — Using the tool
 
-### 1. Account selection
-If multiple accounts are detected, a checkbox lets you choose which ones to include in this scan.
+### Choose what to scan
 
-### 2. Scan scope
 ```
-Which emails should be scanned?
-❯ All unread emails  (recommended — catches mislabelled promos)
+Which emails should be scanned for senders?
+❯ All unread emails  (catches promos Gmail missed) ← recommended
   All emails — read + unread  (most thorough)
   Promotions folder only
   Inbox only (unread)
 ```
 
-### 3. How many to scan
-Enter a number per account (default: 1000). The tool fetches only headers — no message bodies.
+**Recommended:** "All unread emails" catches promotional emails that Gmail incorrectly sorted into your inbox instead of Promotions.
 
-### 4. Review the sender table
-All unique senders across all accounts, sorted by email count. The **Account** column shows which Gmail account each sender wrote to.
+### Choose how many to scan
 
-### 5. Select senders to unsubscribe from
-- **Space** — toggle a sender
-- **A** — select all / deselect all
-- **Enter** — confirm
+```
+How many emails to scan? [1000]
+```
 
-### 6. Choose actions
+Enter a number or press Enter to use the default (1000). Higher numbers take longer but find more senders.
+
+### Review the sender table
+
+The tool displays every unique sender with:
+- Their display name and email address
+- How many emails they've sent you
+- Whether they include an unsubscribe link
+
+### Select senders to unsubscribe from
+
+```
+Select senders to UNSUBSCRIBE from:
+  (Space = toggle, A = select all/none, Enter = confirm)
+
+  [ ] Shopify <no-reply@shopify.com>  (47 emails)
+  [ ] LinkedIn <messages-noreply@linkedin.com>  (31 emails)
+  [ ] Newsletter Co <hello@newsletter.co>  (18 emails)
+```
+
+- Press **Space** to select/deselect a sender
+- Press **A** to select all or deselect all
+- Press **Enter** when done
+
+### Choose what to do
+
 ```
 What do you want to do?
-  ✓ Unsubscribe (send request / open browser)
-  ✓ Delete their unread emails
+  ✓ Unsubscribe  (send unsubscribe request / open browser)
+  ✓ Delete unread emails from these senders
 ```
+
+Both are selected by default. Uncheck either one if you only want to do one action.
 
 ---
 
 ## Troubleshooting
 
-### "IMAP error: [AUTHENTICATIONFAILED]"
-- Wrong App Password — regenerate one at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
-- IMAP not enabled — Gmail → Settings → Forwarding and POP/IMAP → Enable IMAP
-- 2-Step Verification not on — required for App Passwords
+### "Error 403: access_denied"
 
-### "No Gmail accounts found"
-Environment variables aren't set or the terminal wasn't restarted after `setx`. Check with:
-```powershell
-# PowerShell
-echo $env:GMAIL_EMAIL_1
+You haven't added yourself as a test user. Follow **Step 2d** above.
 
-# Command Prompt
-echo %GMAIL_EMAIL_1%
+### "credentials.json not found"
 
-# Mac/Linux
-echo $GMAIL_EMAIL_1
+The credentials file is missing or in the wrong location. Make sure `credentials.json` is in the same folder as `gmail_unsubscriber.py`. Follow **Step 2c** above.
+
+### The tool asks me to sign in every time
+
+Delete `token.pickle` and sign in again. The token may have expired or been revoked.
+
+```bash
+# Mac / Linux
+rm token.pickle
+
+# Windows
+del token.pickle
 ```
-
-### "Error 403: access_denied" (OAuth only)
-Add your Gmail address as a test user:  
-Google Cloud Console → APIs & Services → OAuth consent screen → Test users → + Add Users
 
 ### Unsubscribe opened a browser but nothing happened
-Complete the unsubscribe step manually in the browser tab — some senders require a button click.
 
-### I want to re-authenticate (OAuth only)
+Some senders require you to click a button on their unsubscribe page. The tool opens the page — complete the step manually in the browser tab.
+
+### I want to re-authenticate (switch accounts)
+
+Delete the saved token and restart:
 ```bash
-# Delete the saved token for that account
-del token_you_at_gmail_com.pickle   # Windows
-rm token_you_at_gmail_com.pickle    # Mac/Linux
+rm token.pickle   # or: del token.pickle on Windows
+python gmail_unsubscriber.py
 ```
 
 ---
 
-## Privacy & security
+## Privacy & Security
 
-- **Your emails never leave your machine.** IMAP connects directly from your computer to Gmail.
-- **No message bodies are read.** Only `From` and `List-Unsubscribe` headers are fetched.
-- **App Passwords are stored in your OS environment** — not in any file this tool writes.
-- **`credentials.json` and `token*.pickle` are in `.gitignore`** and will never be committed.
-- **Deleted emails go to Trash** (not permanent deletion) — recoverable for 30 days.
+- **Your emails never leave your computer.** The tool calls Gmail API directly from your machine.
+- **No email body is read.** Only the `From` and `List-Unsubscribe` headers are fetched.
+- **`credentials.json` and `token.pickle` are in `.gitignore`** and will never be committed if you fork this repo.
+- **Deleted emails go to Trash**, not permanent deletion. You have 30 days to recover them.
 
 ---
 
-## OAuth permissions (if using Method B)
+## Permissions explained
 
-| Scope | Purpose |
+The tool requests three Gmail scopes:
+
+| Scope | Why it's needed |
 |---|---|
-| `gmail.readonly` | Read message headers |
-| `gmail.send` | Send unsubscribe emails |
-| `gmail.modify` | Move emails to Trash |
+| `gmail.readonly` | Read email headers to find senders |
+| `gmail.send` | Send unsubscribe emails via `mailto:` links |
+| `gmail.modify` | Move emails to Trash (batchModify) |
 
 ---
 
@@ -275,29 +263,30 @@ rm token_you_at_gmail_com.pickle    # Mac/Linux
 
 ```
 gmail-unsubscriber/
-├── gmail_unsubscriber.py   ← main script
-├── requirements.txt        ← Python dependencies
-├── setup.bat               ← Windows one-click launcher
-├── setup.sh                ← Mac/Linux one-click launcher
-├── .gitignore
-├── LICENSE
-└── README.md
+├── gmail_unsubscriber.py   # main script
+├── requirements.txt        # Python dependencies
+├── setup.bat               # Windows one-click launcher
+├── setup.sh                # Mac/Linux one-click launcher
+├── .gitignore              # excludes credentials and token
+├── LICENSE                 # MIT
+└── README.md               # this file
 
-# Created at runtime (gitignored — never committed):
-├── token_*.pickle          ← saved OAuth tokens
-└── credentials*.json       ← your Google API credentials
+# These are created at runtime and gitignored:
+├── credentials.json        # your Google API credentials (keep private)
+└── token.pickle            # your saved login token (keep private)
 ```
 
 ---
 
 ## Contributing
 
-Pull requests welcome. Ideas:
+Pull requests welcome! Some ideas for improvements:
 
 - [ ] Export sender list to CSV
-- [ ] Dry-run mode (preview without acting)
-- [ ] Per-account summary report
-- [ ] Scheduled/automatic runs
+- [ ] Filter senders by domain
+- [ ] Dry-run mode (show what would be deleted without doing it)
+- [ ] Unsubscribe success/failure log file
+- [ ] Support for multiple Gmail accounts
 
 ---
 
