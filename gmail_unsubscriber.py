@@ -93,81 +93,267 @@ def ask_select(title: str, options: list[str], default: int = 1) -> int:
         console.print(f"[red]Please enter a number between 1 and {len(options)}.[/red]")
 
 
-def ask_multiselect(title: str, options: list[str]) -> list[int]:
+def _read_key() -> str:
     """
-    Range-based multi-select — practical for lists of any size.
-    Accepts numbers, ranges (1-50), combinations, 'all', 'none'.
+    Read a single keypress without waiting for Enter.
+    Returns a string: 'UP','DOWN','PGUP','PGDN','SPACE','ENTER','BACKSPACE','ESC',
+    a single printable character, or 'OTHER'.
+    Works on Windows (msvcrt) and Unix/Mac (tty+termios).
+    Falls back to plain input() if stdin is not a tty.
+    """
+    if not sys.stdin.isatty():
+        return input()  # non-interactive fallback
+
+    if os.name == "nt":
+        import msvcrt
+        ch = msvcrt.getch()
+        if ch in (b"\xe0", b"\x00"):          # extended key prefix
+            ch2 = msvcrt.getch()
+            return {b"H": "UP", b"P": "DOWN", b"I": "PGUP", b"Q": "PGDN"}.get(ch2, "OTHER")
+        if ch == b"\r":   return "ENTER"
+        if ch == b" ":    return "SPACE"
+        if ch == b"\x1b": return "ESC"
+        if ch == b"\x08": return "BACKSPACE"
+        if ch == b"\x03": raise KeyboardInterrupt
+        try:
+            return ch.decode("utf-8")
+        except Exception:
+            return "OTHER"
+    else:
+        import tty, termios, select
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.buffer.read(1)
+            if ch == b"\x1b":
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if ready:
+                    seq = sys.stdin.buffer.read(2)
+                    return {b"[A": "UP", b"[B": "DOWN", b"[5": "PGUP", b"[6": "PGDN"}.get(seq, "ESC")
+                return "ESC"
+            if ch in (b"\r", b"\n"): return "ENTER"
+            if ch == b" ":           return "SPACE"
+            if ch in (b"\x7f", b"\x08"): return "BACKSPACE"
+            if ch == b"\x03":        raise KeyboardInterrupt
+            try:
+                return ch.decode("utf-8")
+            except Exception:
+                return "OTHER"
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def interactive_checkbox(title: str, options: list[str]) -> list[int]:
+    """
+    Full interactive checkbox.
+      ↑ ↓         navigate
+      Space       toggle checkbox on current item
+      PgUp/PgDn   jump a page
+      /           type a search filter, Enter to apply, Esc to clear
+      a           select all visible
+      n           deselect all visible
+      Enter       confirm selection
+      q           cancel
     Returns sorted list of selected 1-based indices.
+    Falls back to range-input if stdin is not a tty.
     """
+    if not sys.stdin.isatty():
+        return _range_select_fallback(title, options)
+
+    PAGE      = 22
+    selected: set[int] = set()   # 0-based original indices
+    cursor    = 0                # position in filtered list
+    scroll    = 0                # top of visible window
+    filt      = ""               # active search string
+    status    = ""               # one-line status message
+
+    def filtered() -> list[int]:
+        if not filt:
+            return list(range(len(options)))
+        fl = filt.lower()
+        return [i for i, o in enumerate(options) if fl in o.lower()]
+
+    def clamp(fi: list[int]):
+        nonlocal cursor, scroll
+        n = len(fi)
+        if n == 0:
+            cursor = scroll = 0
+            return
+        cursor = max(0, min(cursor, n - 1))
+        scroll = max(0, min(scroll, n - 1))
+        if cursor < scroll:
+            scroll = cursor
+        elif cursor >= scroll + PAGE:
+            scroll = cursor - PAGE + 1
+
+    def render(fi: list[int]):
+        # ANSI clear + move to top
+        sys.stdout.write("\033[H\033[2J")
+        n_sel = len(selected)
+        n_vis = len(fi)
+        n_tot = len(options)
+
+        print(f"\n  \033[1m{title}\033[0m")
+        print(f"  \033[32m{n_sel} selected\033[0m  ·  {n_vis}/{n_tot} shown"
+              + (f"  ·  filter: \033[33m{filt}\033[0m" if filt else ""))
+        if status:
+            print(f"  \033[33m{status}\033[0m")
+        print()
+        print("  \033[2m↑↓=move  Space=check  a=all  n=none  /=search  PgUp/PgDn=page  Enter=done  q=quit\033[0m")
+        print()
+
+        visible = fi[scroll : scroll + PAGE]
+        for rel, orig in enumerate(visible):
+            abs_i  = scroll + rel
+            is_cur = abs_i == cursor
+            is_sel = orig in selected
+
+            box   = "\033[32m[✓]\033[0m" if is_sel else "[ ]"
+            arrow = "\033[36m▶\033[0m"   if is_cur else " "
+            text  = options[orig]
+
+            if is_cur:
+                print(f"  {arrow} {box} \033[7m{text}\033[0m")
+            elif is_sel:
+                print(f"  {arrow} {box} \033[32m{text}\033[0m")
+            else:
+                print(f"  {arrow} {box} {text}")
+
+        if n_vis > PAGE:
+            pages  = (n_vis - 1) // PAGE + 1
+            cur_pg = scroll // PAGE + 1
+            end    = min(scroll + PAGE, n_vis)
+            print(f"\n  \033[2mPage {cur_pg}/{pages}  ({scroll+1}–{end} of {n_vis})\033[0m")
+
+        sys.stdout.flush()
+
+    while True:
+        fi = filtered()
+        clamp(fi)
+        render(fi)
+        status = ""
+
+        try:
+            key = _read_key()
+        except KeyboardInterrupt:
+            sys.stdout.write("\033[H\033[2J")
+            return []
+
+        if key == "UP":
+            if cursor > 0:
+                cursor -= 1
+                if cursor < scroll:
+                    scroll -= 1
+
+        elif key == "DOWN":
+            if cursor < len(fi) - 1:
+                cursor += 1
+                if cursor >= scroll + PAGE:
+                    scroll += 1
+
+        elif key == "PGUP":
+            cursor = max(0, cursor - PAGE)
+            scroll = max(0, scroll - PAGE)
+
+        elif key == "PGDN":
+            n = len(fi)
+            cursor = min(max(0, n - 1), cursor + PAGE)
+            scroll = min(max(0, n - PAGE), scroll + PAGE)
+
+        elif key == "SPACE":
+            if fi:
+                orig = fi[cursor]
+                if orig in selected:
+                    selected.discard(orig)
+                else:
+                    selected.add(orig)
+
+        elif key == "ENTER":
+            sys.stdout.write("\033[H\033[2J")
+            sys.stdout.flush()
+            return sorted(i + 1 for i in selected)
+
+        elif key == "q":
+            sys.stdout.write("\033[H\033[2J")
+            sys.stdout.flush()
+            return []
+
+        elif key == "a":
+            for i in fi:
+                selected.add(i)
+            status = f"Selected all {len(fi)} visible sender(s)."
+
+        elif key == "n":
+            for i in fi:
+                selected.discard(i)
+            status = "Deselected all visible."
+
+        elif key == "/":
+            # Open inline search prompt at bottom of screen
+            sys.stdout.write("\033[H\033[2J")
+            sys.stdout.flush()
+            try:
+                new_filt = input("  Search (Enter=apply, blank=clear): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                new_filt = filt
+            filt   = new_filt
+            cursor = 0
+            scroll = 0
+
+        elif key == "ESC":
+            filt   = ""
+            cursor = 0
+            scroll = 0
+
+        elif key == "BACKSPACE":
+            if filt:
+                filt   = filt[:-1]
+                cursor = 0
+                scroll = 0
+
+
+def _range_select_fallback(title: str, options: list[str]) -> list[int]:
+    """Fallback range-input selector used when stdin is not a tty."""
     n = len(options)
-    console.print(f"\n[bold]{title}[/bold]  [dim]({n} senders with unsubscribe link)[/dim]\n")
-
-    console.print(
-        "  [dim]How to select:\n"
-        "    1-10        → senders 1 through 10\n"
-        "    1 3 5       → specific numbers\n"
-        "    1-50 75 90  → mix of ranges and numbers\n"
-        "    all         → select every sender\n"
-        "    none / q    → cancel[/dim]\n"
-    )
-
+    console.print(f"\n[bold]{title}[/bold]  ({n} options)\n")
+    console.print("  [dim]1-10 · 1 3 5 · 1-50 75 · all · none[/dim]\n")
     while True:
         try:
             raw = input("  Select > ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            console.print("\n[yellow]Cancelled.[/yellow]")
             sys.exit(0)
-
         if raw in ("none", "q", ""):
             return []
         if raw == "all":
-            console.print(f"  [green]Selected all {n} sender(s).[/green]")
             return list(range(1, n + 1))
-
-        selected: set[int] = set()
-        error = False
+        sel: set[int] = set()
+        err = False
         for part in raw.replace(",", " ").split():
             if "-" in part:
                 a, _, b = part.partition("-")
                 if a.isdigit() and b.isdigit():
                     lo, hi = int(a), int(b)
                     if 1 <= lo <= n and 1 <= hi <= n and lo <= hi:
-                        selected.update(range(lo, hi + 1))
+                        sel.update(range(lo, hi + 1))
                     else:
-                        console.print(f"  [red]Range {part} out of bounds (1–{n})[/red]")
-                        error = True; break
+                        console.print(f"  [red]Out of range: {part}[/red]")
+                        err = True; break
                 else:
-                    console.print(f"  [red]Invalid range: '{part}'[/red]")
-                    error = True; break
+                    console.print(f"  [red]Bad range: {part}[/red]")
+                    err = True; break
             elif part.isdigit():
                 num = int(part)
                 if 1 <= num <= n:
-                    selected.add(num)
+                    sel.add(num)
                 else:
-                    console.print(f"  [red]{num} is out of bounds (1–{n})[/red]")
-                    error = True; break
-            else:
-                console.print(f"  [red]Unknown input: '{part}'[/red]")
-                error = True; break
-
-        if error:
+                    console.print(f"  [red]{num} out of range[/red]")
+                    err = True; break
+        if err:
             continue
-        if not selected:
-            console.print("  [yellow]Nothing matched.[/yellow]")
+        if not sel:
             continue
-
-        # Preview selection before confirming
-        sorted_sel = sorted(selected)
-        names = [options[i - 1].split("<")[0].strip()[:22] for i in sorted_sel[:6]]
-        more  = f" +{len(sorted_sel) - 6} more" if len(sorted_sel) > 6 else ""
-        console.print(f"\n  [green]{len(sorted_sel)} selected:[/green] {', '.join(names)}{more}")
-        try:
-            confirm = input("  Confirm? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            sys.exit(0)
-        if confirm in ("", "y", "yes"):
-            return sorted_sel
-        # else loop back to re-enter
+        return sorted(sel)
 
 
 def ask_actions(selected_count: int) -> tuple[bool, bool]:
@@ -624,32 +810,30 @@ def _oauth_delete_unread(service, sender_emails: list[str]) -> int:
 # Display
 # ─────────────────────────────────────────────────────────────────────────────
 
-def show_table(senders: dict, multi_account: bool = False):
+def show_table(senders: dict):
     table = Table(
         title=f"[bold]Unique Senders[/bold]  ({len(senders)} total)",
         header_style="bold cyan", show_lines=False,
     )
     table.add_column("#",            style="dim",    width=4,  justify="right")
-    if multi_account:
-        table.add_column("Account",  style="magenta", max_width=24)
-    table.add_column("Display Name", style="white",  min_width=22, max_width=32)
+    table.add_column("Display Name", style="white",  min_width=22, max_width=30)
     table.add_column("Email",        style="cyan",   min_width=26, max_width=40)
     table.add_column("Count",        style="yellow", width=6,  justify="right")
-    table.add_column("Unsub Link",   style="green",  width=10, justify="center")
+    table.add_column("Accounts",     style="magenta",width=8,  justify="right")
+    table.add_column("Unsub",        style="green",  width=6,  justify="center")
 
     for i, s in enumerate(
         sorted(senders.values(), key=lambda x: x["count"], reverse=True), 1
     ):
-        row = [str(i)]
-        if multi_account:
-            row.append(s.get("account","")[:24])
-        row += [
-            (s["name"] or "—")[:32],
+        accts = s.get("accounts", [])
+        table.add_row(
+            str(i),
+            (s["name"] or "—")[:30],
             s["email"][:40],
             str(s["count"]),
+            str(len(accts)),
             "[green]yes[/green]" if s["unsubscribe"] else "[red dim]no[/red dim]",
-        ]
-        table.add_row(*row)
+        )
     console.print(table)
 
 
@@ -819,42 +1003,54 @@ def main():
         console.print("[yellow]No senders found.[/yellow]")
         return
 
-    # Flatten: merge counts from same sender across multiple accounts
+    # ── Flatten: one entry per sender email, track ALL accounts it was seen in ──
+    # Same sender found in 3 accounts → shows once, actions applied to all 3.
     flat: dict = {}
     for key, data in all_senders.items():
-        ea = key.split("||")[0]
+        ea, acct = key.split("||", 1)
         if ea not in flat:
             flat[ea] = dict(data)
+            flat[ea]["accounts"] = [acct]          # list of gmail accounts
         else:
             flat[ea]["count"] += data["count"]
+            if acct not in flat[ea]["accounts"]:
+                flat[ea]["accounts"].append(acct)
+            # Keep the best unsubscribe link we've seen
+            if not flat[ea]["unsubscribe"] and data.get("unsubscribe"):
+                flat[ea]["unsubscribe"] = data["unsubscribe"]
 
-    multi = len(accounts) > 1
     console.print(
         f"\n[green]Found {len(flat)} unique sender(s)"
-        + (f" across {len(accounts)} accounts" if multi else "")
+        + (f" across {len(accounts)} accounts" if len(accounts) > 1 else "")
         + ".[/green]\n"
     )
-    show_table(flat, multi_account=multi)
+    show_table(flat)
 
-    # ── Step 5: Choose senders ────────────────────────────────────────────
+    # ── Step 5: Choose senders (interactive checkbox) ─────────────────────
     sorted_s  = sorted(flat.values(), key=lambda x: x["count"], reverse=True)
     can_unsub = [s for s in sorted_s if s["unsubscribe"]]
     no_link   = [s for s in sorted_s if not s["unsubscribe"]]
 
     if no_link:
-        console.print(f"[yellow]{len(no_link)} sender(s) have no unsubscribe link (excluded from list).[/yellow]")
+        console.print(f"[yellow]{len(no_link)} sender(s) have no unsubscribe link (excluded).[/yellow]")
     if not can_unsub:
         console.print("[red]No senders with an unsubscribe link found.[/red]")
         return
 
-    options = [
-        f"{(s['name'] or s['email'])[:30]:30}  <{s['email'][:38]}>  ({s['count']} emails)"
-        + (f"  [{s['account'][:20]}]" if multi else "")
-        for s in can_unsub
-    ]
-    selected_indices = ask_multiselect(
-        "Select senders to UNSUBSCRIBE from:",
-        options,
+    # Build label for each checkbox row
+    def _row_label(s: dict) -> str:
+        accts = s.get("accounts", [])
+        acct_label = (f"{len(accts)} accts" if len(accts) > 1
+                      else accts[0][:22] if accts else "")
+        name  = (s["name"] or s["email"])[:28]
+        email = s["email"][:36]
+        return f"{name:<28}  {email:<36}  {s['count']:>4} emails  {acct_label}"
+
+    checkbox_opts = [_row_label(s) for s in can_unsub]
+
+    selected_indices = interactive_checkbox(
+        f"Select senders to UNSUBSCRIBE / DELETE from  ({len(can_unsub)} available):",
+        checkbox_opts,
     )
     if not selected_indices:
         console.print("\n[yellow]Nothing selected — bye![/yellow]")
@@ -881,35 +1077,40 @@ def main():
         for s in selected_senders:
             ea    = s["email"]
             unsub = s["unsubscribe"]
-            acct  = s.get("account", "")
+            accts = s.get("accounts", [])
             console.print(f"  [white]{s['name'] or ea} <{ea}>[/white]"
-                          + (f"  [dim]({acct})[/dim]" if multi else ""))
+                          + (f"  [dim]({', '.join(accts)})[/dim]" if len(accts) > 1 else ""))
 
             sent = False
             if unsub and unsub.get("mailto"):
-                if method == "imap" and acct in imap_conns:
-                    _, pwd = imap_conns[acct]
-                    sent = _imap_send_unsub(acct, pwd, unsub["mailto"])
-                elif method == "oauth" and service:
-                    try:
-                        m2   = re.match(r"mailto:([^?]+)(?:\?(.*))?", unsub["mailto"], re.I)
-                        to_a = m2.group(1).strip()
-                        prms = {}
-                        if m2.group(2):
-                            for kv in m2.group(2).split("&"):
-                                if "=" in kv:
-                                    k, v = kv.split("=", 1)
-                                    prms[k.lower()] = v.replace("+", " ")
-                        mime = MIMEText(prms.get("body", "Please unsubscribe me."))
-                        mime["to"]      = to_a
-                        mime["subject"] = prms.get("subject", "Unsubscribe")
-                        raw_b64 = base64.urlsafe_b64encode(mime.as_bytes()).decode()
-                        service.users().messages().send(
-                            userId="me", body={"raw": raw_b64}
-                        ).execute()
-                        sent = True
-                    except Exception as e:
-                        console.print(f"    [red]Error: {e}[/red]")
+                # Try each account — succeed on first
+                for acct in accts:
+                    if method == "imap" and acct in imap_conns:
+                        _, pwd = imap_conns[acct]
+                        if _imap_send_unsub(acct, pwd, unsub["mailto"]):
+                            sent = True
+                            break
+                    elif method == "oauth" and service:
+                        try:
+                            m2   = re.match(r"mailto:([^?]+)(?:\?(.*))?", unsub["mailto"], re.I)
+                            to_a = m2.group(1).strip()
+                            prms = {}
+                            if m2.group(2):
+                                for kv in m2.group(2).split("&"):
+                                    if "=" in kv:
+                                        k, v = kv.split("=", 1)
+                                        prms[k.lower()] = v.replace("+", " ")
+                            mime = MIMEText(prms.get("body", "Please unsubscribe me."))
+                            mime["to"]      = to_a
+                            mime["subject"] = prms.get("subject", "Unsubscribe")
+                            raw_b64 = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+                            service.users().messages().send(
+                                userId="me", body={"raw": raw_b64}
+                            ).execute()
+                            sent = True
+                            break
+                        except Exception as e:
+                            console.print(f"    [red]Error: {e}[/red]")
 
             if sent:
                 console.print("    [green]✓ Unsubscribe email sent[/green]")
@@ -929,15 +1130,17 @@ def main():
             f"  [red]Failed         : {len(failed)}[/red]"
         )
 
-    # ── Step 8: Delete ────────────────────────────────────────────────────
+    # ── Step 8: Delete (from ALL accounts the sender was seen in) ────────
     if do_delete:
         console.print(f"\n[bold cyan]Deleting unread emails from {len(selected_emails)} sender(s)…[/bold cyan]")
         total_deleted = 0
 
         if method == "imap":
+            # Build per-account work list: each account deletes senders it received from
             by_account: dict = defaultdict(list)
             for s in selected_senders:
-                by_account[s.get("account","")].append(s["email"])
+                for acct in s.get("accounts", []):
+                    by_account[acct].append(s["email"])
 
             for acct_email, email_list in by_account.items():
                 if acct_email not in imap_conns:
