@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import (
     Qt, QThread, Signal, QAbstractTableModel, QModelIndex,
     QSortFilterProxyModel, QRegularExpression, QTimer, QSize,
-    QObject
+    QObject, QEvent
 )
 from PySide6.QtGui import QFont, QColor, QIcon, QPixmap, QPalette
 
@@ -126,6 +126,52 @@ def _parse_unsub(value: str) -> Optional[dict]:
         return None
     return {"mailto": mailto[0] if mailto else None,
             "http":   http[0]   if http   else None}
+
+
+def _detect_gmail_env_accounts() -> list:
+    """
+    Scan os.environ for Gmail credential pairs.
+    Recognises:
+      • GMAIL_EMAIL  /  GMAIL_PASSWORD  (+ _APP_PASSWORD, _APP_PASS, _PASS variants)
+      • GMAIL_EMAIL_1 / GMAIL_PASSWORD_1 … (indexed, up to _9)
+      • GOOGLE_EMAIL / GOOGLE_PASSWORD variants
+    Returns [(email, password), ...] deduplicated by email (case-insensitive).
+    """
+    env   = os.environ
+    found, seen = [], set()
+
+    def _push(e: str, p: str):
+        e = e.strip()
+        if (e and p and e.lower() not in seen and
+                ("@gmail.com" in e.lower() or "@googlemail.com" in e.lower())):
+            seen.add(e.lower())
+            found.append((e, p.strip()))
+
+    E_KEYS = ["GMAIL_EMAIL", "GMAIL_USER", "GOOGLE_EMAIL"]
+    P_KEYS = ["GMAIL_APP_PASSWORD", "GMAIL_APP_PASS", "GMAIL_PASSWORD",
+              "GMAIL_PASS",         "GOOGLE_APP_PASSWORD", "GOOGLE_PASSWORD"]
+
+    # singular keys
+    for ek in E_KEYS:
+        if ek in env:
+            for pk in P_KEYS:
+                if pk in env:
+                    _push(env[ek], env[pk])
+                    break
+
+    # indexed keys  GMAIL_EMAIL_1 / GMAIL_PASSWORD_1, …
+    for i in range(1, 10):
+        email = next(
+            (env[k] for k in [f"GMAIL_EMAIL_{i}", f"GMAIL_USER_{i}",
+                               f"GOOGLE_EMAIL_{i}"] if k in env), "")
+        if not email:
+            break
+        pwd = next(
+            (env[k] for k in [f"GMAIL_APP_PASSWORD_{i}", f"GMAIL_APP_PASS_{i}",
+                               f"GMAIL_PASSWORD_{i}",    f"GMAIL_PASS_{i}"] if k in env), "")
+        _push(email, pwd)
+
+    return found
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -479,6 +525,81 @@ def _sub(text: str) -> QLabel:
     return lbl
 
 
+# ── Account row widget ────────────────────────────────────────────────────────
+
+class AccountRow(QFrame):
+    """One Gmail credential pair in the sign-in IMAP section."""
+    remove_clicked = Signal(object)   # emits self so the parent can remove it
+
+    def __init__(self, email: str = "", password: str = "", from_env: bool = False):
+        super().__init__()
+        self._from_env = from_env
+        self._build(email, password)
+
+    def _build(self, email: str, password: str):
+        self.setObjectName("acctRow")
+        lay = QVBoxLayout(self)
+        lay.setSpacing(6)
+        lay.setContentsMargins(12, 10, 12, 10)
+
+        # top bar: env badge + remove ×
+        top = QHBoxLayout()
+        if self._from_env:
+            badge = QLabel("  detected from env  ")
+            badge.setStyleSheet(
+                "background:#dcfce7; color:#16a34a; border-radius:4px;"
+                "padding:1px 7px; font-size:11px; font-weight:600;")
+            top.addWidget(badge)
+        top.addStretch()
+        self._rm_btn = QToolButton()
+        self._rm_btn.setText("✕")
+        self._rm_btn.setFixedSize(22, 22)
+        self._rm_btn.setStyleSheet(
+            "QToolButton{border:none;color:#94a3b8;font-size:13px;background:transparent;}"
+            "QToolButton:hover{color:#ef4444;}")
+        self._rm_btn.clicked.connect(lambda: self.remove_clicked.emit(self))
+        top.addWidget(self._rm_btn)
+        lay.addLayout(top)
+
+        # email
+        self._email_edit = QLineEdit(email)
+        self._email_edit.setPlaceholderText("you@gmail.com")
+        lay.addWidget(self._email_edit)
+
+        # password + show toggle
+        pr = QHBoxLayout()
+        self._pwd_edit = QLineEdit(password)
+        self._pwd_edit.setPlaceholderText("App Password  (xxxx xxxx xxxx xxxx)")
+        self._pwd_edit.setEchoMode(QLineEdit.Password)
+        show = QToolButton()
+        show.setText("👁")
+        show.setFixedSize(36, 36)
+        show.setCheckable(True)
+        show.toggled.connect(
+            lambda on: self._pwd_edit.setEchoMode(
+                QLineEdit.Normal if on else QLineEdit.Password))
+        pr.addWidget(self._pwd_edit, 1)
+        pr.addWidget(show)
+        lay.addLayout(pr)
+
+        # per-row status
+        self._status_lbl = QLabel("")
+        self._status_lbl.setObjectName("sub")
+        lay.addWidget(self._status_lbl)
+
+    @property
+    def email(self)     -> str:  return self._email_edit.text().strip()
+    @property
+    def password(self)  -> str:  return self._pwd_edit.text().strip()
+    @property
+    def is_filled(self) -> bool: return bool(self.email and self.password)
+
+    def set_status(self, msg: str, ok: bool):
+        self._status_lbl.setText(msg)
+        self._status_lbl.setStyleSheet(
+            f"color:{'#22c55e' if ok else '#ef4444'}; font-size:12px;")
+
+
 # ── Screen 1: Sign-in ────────────────────────────────────────────────────────
 
 class SignInScreen(QWidget):
@@ -486,90 +607,82 @@ class SignInScreen(QWidget):
 
     def __init__(self, state: AppState):
         super().__init__()
-        self._state = state
+        self._state         = state
         self._workers: list = []
+        self._rows:    list = []   # list[AccountRow]
+        self._pending        = 0
+        self._conn_errors    = 0
         self._build()
 
+    # ── layout ──────────────────────────────────────────────────────
     def _build(self):
         root = QVBoxLayout(self)
         root.setAlignment(Qt.AlignCenter)
 
-        card = _card(420)
+        card = _card(480)
         cl   = QVBoxLayout(card)
         cl.setSpacing(18)
         cl.setContentsMargins(36, 36, 36, 36)
 
         cl.addWidget(_title(APP_NAME))
-        cl.addWidget(_sub("Connect your Gmail account"))
+        cl.addWidget(_sub("Connect your Gmail account(s)"))
         cl.addSpacing(4)
 
         # ── auth method radios ──
-        grp = QGroupBox("Sign-in method")
-        gl  = QVBoxLayout(grp)
+        method_grp = QGroupBox("Sign-in method")
+        ml = QVBoxLayout(method_grp)
         self._oauth_rb = QRadioButton("Sign in with Google  (OAuth — recommended)")
-        self._imap_rb  = QRadioButton("App Password  (IMAP — works without Google Console)")
+        self._imap_rb  = QRadioButton("App Password + IMAP  (supports multiple accounts)")
         self._oauth_rb.setChecked(True)
-        gl.addWidget(self._oauth_rb)
-        gl.addWidget(self._imap_rb)
-        cl.addWidget(grp)
+        ml.addWidget(self._oauth_rb)
+        ml.addWidget(self._imap_rb)
+        cl.addWidget(method_grp)
 
-        # ── IMAP fields ──
-        self._imap_frame = QFrame()
+        # ── IMAP section ──
+        self._imap_frame = QWidget()
         il = QVBoxLayout(self._imap_frame)
-        il.setSpacing(6)
+        il.setSpacing(8)
         il.setContentsMargins(0, 0, 0, 0)
 
-        il.addWidget(QLabel("Gmail address"))
-        self._email_input = QLineEdit()
-        self._email_input.setPlaceholderText("you@gmail.com")
-        il.addWidget(self._email_input)
+        # env detection banner (hidden until populated)
+        self._env_banner = QLabel("")
+        self._env_banner.setVisible(False)
+        il.addWidget(self._env_banner)
 
-        il.addWidget(QLabel("App Password"))
-        pwd_row = QHBoxLayout()
-        self._pwd_input = QLineEdit()
-        self._pwd_input.setPlaceholderText("xxxx xxxx xxxx xxxx")
-        self._pwd_input.setEchoMode(QLineEdit.Password)
-        self._show_pwd  = QToolButton()
-        self._show_pwd.setText("👁")
-        self._show_pwd.setFixedSize(36, 36)
-        self._show_pwd.setCheckable(True)
-        self._show_pwd.toggled.connect(
-            lambda on: self._pwd_input.setEchoMode(
-                QLineEdit.Normal if on else QLineEdit.Password))
-        pwd_row.addWidget(self._pwd_input, 1)
-        pwd_row.addWidget(self._show_pwd)
-        il.addLayout(pwd_row)
+        # account rows container
+        self._rows_widget = QWidget()
+        self._rows_lay    = QVBoxLayout(self._rows_widget)
+        self._rows_lay.setSpacing(8)
+        self._rows_lay.setContentsMargins(0, 0, 0, 0)
+        il.addWidget(self._rows_widget)
 
+        # + Add another account
+        add_lay = QHBoxLayout()
+        self._add_btn = QPushButton("+ Add another account")
+        self._add_btn.setObjectName("secondary")
+        self._add_btn.setFixedHeight(34)
+        add_lay.addWidget(self._add_btn)
+        add_lay.addStretch()
+        il.addLayout(add_lay)
+
+        # app-password help link
         hint = QLabel('<a href="https://myaccount.google.com/apppasswords">'
                       'How to get an App Password ↗</a>')
         hint.setOpenExternalLinks(True)
         hint.setObjectName("sub")
         il.addWidget(hint)
+
         self._imap_frame.setVisible(False)
         cl.addWidget(self._imap_frame)
 
-        # ── add-account row (shown after first connect in IMAP mode) ──
-        self._add_row = QFrame()
-        ar = QHBoxLayout(self._add_row)
-        ar.setContentsMargins(0, 0, 0, 0)
-        self._accounts_label = QLabel("No accounts connected")
-        self._accounts_label.setObjectName("sub")
-        add_btn = QPushButton("+ Add account")
-        add_btn.setObjectName("secondary")
-        add_btn.setFixedWidth(130)
-        ar.addWidget(self._accounts_label, 1)
-        ar.addWidget(add_btn)
-        self._add_row.setVisible(False)
-        cl.addWidget(self._add_row)
-
-        # ── error label ──
+        # ── error banner ──
         self._err = QLabel("")
         self._err.setObjectName("error")
         self._err.setWordWrap(True)
         self._err.setVisible(False)
         cl.addWidget(self._err)
 
-        # ── connect button ──
+        # ── action button ──
         self._btn = QPushButton("Connect →")
         self._btn.setFixedHeight(44)
         cl.addWidget(self._btn)
@@ -580,79 +693,164 @@ class SignInScreen(QWidget):
         self._oauth_rb.toggled.connect(self._toggle_method)
         self._imap_rb.toggled.connect(self._toggle_method)
         self._btn.clicked.connect(self._on_connect)
-        add_btn.clicked.connect(self._on_add_account)
+        self._add_btn.clicked.connect(lambda: self._add_row())
 
+        # populate rows from env (or one blank row)
+        self._populate_env_accounts()
+
+    # ── env population ───────────────────────────────────────────────
+    def _populate_env_accounts(self):
+        env_accts = _detect_gmail_env_accounts()
+        if env_accts:
+            n = len(env_accts)
+            self._env_banner.setText(
+                f"  ✓  Found {n} account{'s' if n > 1 else ''} in environment variables "
+                f"— passwords pre-filled.")
+            self._env_banner.setStyleSheet(
+                "background:#dcfce7; color:#16a34a; border-radius:6px; "
+                "padding:6px 10px; font-size:12px;")
+            self._env_banner.setVisible(True)
+            for email, pwd in env_accts:
+                self._add_row(email, pwd, from_env=True)
+        else:
+            self._add_row()   # start with one blank row
+
+    # ── row management ───────────────────────────────────────────────
+    def _add_row(self, email: str = "", password: str = "", from_env: bool = False):
+        row = AccountRow(email, password, from_env)
+        row.remove_clicked.connect(self._remove_row)
+        self._rows.append(row)
+        self._rows_lay.addWidget(row)
+        self._refresh_remove_buttons()
+
+    def _remove_row(self, row: "AccountRow"):
+        if len(self._rows) <= 1:
+            return   # always keep at least one row
+        self._rows.remove(row)
+        self._rows_lay.removeWidget(row)
+        row.deleteLater()
+        self._refresh_remove_buttons()
+
+    def _refresh_remove_buttons(self):
+        """Show ✕ only when there are 2+ rows."""
+        show = len(self._rows) > 1
+        for r in self._rows:
+            r._rm_btn.setVisible(show)
+
+    # ── method toggle ────────────────────────────────────────────────
     def _toggle_method(self):
-        is_imap = self._imap_rb.isChecked()
-        self._imap_frame.setVisible(is_imap)
+        self._imap_frame.setVisible(self._imap_rb.isChecked())
         self._err.setVisible(False)
 
+    # ── error helper ─────────────────────────────────────────────────
     def _show_err(self, msg: str):
         self._btn.setEnabled(True)
-        self._btn.setText("Connect →")
         self._err.setText(msg)
         self._err.setVisible(True)
 
+    # ── connect ──────────────────────────────────────────────────────
     def _on_connect(self):
         self._err.setVisible(False)
-        self._btn.setEnabled(False)
-        self._btn.setText("Connecting…")
-
         if self._imap_rb.isChecked():
-            email = self._email_input.text().strip()
-            pwd   = self._pwd_input.text().strip()
-            if not email or not pwd:
-                self._show_err("Please enter your Gmail address and App Password.")
-                return
-            w = IMAPAuthWorker(email, pwd)
-            w.success.connect(self._imap_ok)
-            w.error.connect(self._show_err)
-            self._workers.append(w)
-            w.start()
+            self._connect_imap()
         else:
-            if not OAUTH_AVAILABLE:
-                self._show_err("OAuth libraries not installed.\n"
-                               "Run: pip install google-auth google-auth-oauthlib google-api-python-client")
-                return
-            if not CREDS_FILE.exists():
-                self._show_err(f"credentials.json not found.\nExpected at: {CREDS_FILE}\n"
-                               "Download it from Google Cloud Console → APIs & Services → Credentials.")
-                return
-            w = OAuthWorker()
-            w.success.connect(self._oauth_ok)
-            w.error.connect(self._show_err)
+            self._connect_oauth()
+
+    def _connect_imap(self):
+        filled = [r for r in self._rows if r.is_filled]
+        if not filled:
+            self._show_err(
+                "Please enter at least one Gmail address and App Password.")
+            return
+        self._err.setVisible(False)
+        self._btn.setEnabled(False)
+        n = len(filled)
+        self._btn.setText(f"Connecting {n} account{'s' if n > 1 else ''}…")
+        self._pending     = n
+        self._conn_errors = 0
+        self._state.imap_conns.clear()   # reset any previous session
+
+        for row in filled:
+            w = IMAPAuthWorker(row.email, row.password)
+            w.success.connect(lambda email, conn, r=row: self._imap_ok(email, conn, r))
+            w.error.connect(  lambda msg,       r=row: self._imap_err(msg, r))
             self._workers.append(w)
             w.start()
 
-    def _imap_ok(self, email: str, conn):
-        self._state.auth_method = "imap"
-        self._state.imap_conns[email] = (conn, self._pwd_input.text().strip())
-        self._btn.setText("Connected ✓")
+    def _imap_ok(self, email: str, conn, row: "AccountRow"):
+        self._state.imap_conns[email] = (conn, row.password)
+        row.set_status("✓  Connected", True)
+        self._pending -= 1
+        self._check_done()
+
+    def _imap_err(self, msg: str, row: "AccountRow"):
+        short = msg.split("\n")[0][:80]
+        row.set_status(f"✗  {short}", False)
+        self._conn_errors += 1
+        self._pending -= 1
+        self._check_done()
+
+    def _check_done(self):
+        if self._pending > 0:
+            return
         self._btn.setEnabled(True)
-        n = len(self._state.imap_conns)
-        self._accounts_label.setText(
-            f"{'✓  ' + '  ✓  '.join(self._state.imap_conns.keys())}")
-        self._add_row.setVisible(True)
-        # Change button to "Continue"
-        self._btn.setText("Continue →")
-        self._btn.clicked.disconnect()
-        self._btn.clicked.connect(self.go_next.emit)
+        try:
+            self._btn.clicked.disconnect()
+        except RuntimeError:
+            pass
+
+        ok_count = len(self._state.imap_conns)
+        if self._conn_errors == 0:
+            # All succeeded
+            self._state.auth_method = "imap"
+            self._btn.setText("Continue →")
+            self._btn.clicked.connect(self.go_next.emit)
+        elif ok_count > 0:
+            # Partial success — let user continue with what connected
+            self._state.auth_method = "imap"
+            self._show_err(
+                f"{self._conn_errors} account(s) failed to connect.  "
+                f"Fix above and retry, or continue with the "
+                f"{ok_count} successfully connected account(s).")
+            self._btn.setText(f"Continue with {ok_count} account(s) →")
+            self._btn.clicked.connect(self.go_next.emit)
+        else:
+            # All failed
+            self._show_err(
+                "All accounts failed to connect.  "
+                "Double-check your Gmail addresses and App Passwords.")
+            self._btn.setText("Retry →")
+            self._btn.clicked.connect(self._on_connect)
+
+    def _connect_oauth(self):
+        if not OAUTH_AVAILABLE:
+            self._show_err(
+                "OAuth libraries not installed.\n"
+                "Run: pip install google-auth google-auth-oauthlib google-api-python-client")
+            return
+        if not CREDS_FILE.exists():
+            self._show_err(
+                f"credentials.json not found.\nExpected at: {CREDS_FILE}\n"
+                "Download from Google Cloud Console → APIs & Services → Credentials.")
+            return
+        self._btn.setEnabled(False)
+        self._btn.setText("Opening browser…")
+        w = OAuthWorker()
+        w.success.connect(self._oauth_ok)
+        w.error.connect(self._show_err)
+        self._workers.append(w)
+        w.start()
 
     def _oauth_ok(self, service):
-        self._state.auth_method = "oauth"
+        self._state.auth_method   = "oauth"
         self._state.oauth_service = service
         self._btn.setText("Continue →")
         self._btn.setEnabled(True)
-        self._btn.clicked.disconnect()
+        try:
+            self._btn.clicked.disconnect()
+        except RuntimeError:
+            pass
         self._btn.clicked.connect(self.go_next.emit)
-
-    def _on_add_account(self):
-        """Clear the fields so the user can add a second account."""
-        self._email_input.clear()
-        self._pwd_input.clear()
-        self._btn.setText("Connect →")
-        self._btn.clicked.disconnect()
-        self._btn.clicked.connect(self._on_connect)
 
 
 # ── Screen 2: Scan config ─────────────────────────────────────────────────────
@@ -972,6 +1170,11 @@ class SendersScreen(QWidget):
         self._delete_btn.clicked.connect(lambda: self._confirm_action(False, True))
         self._both_btn.clicked.connect(  lambda: self._confirm_action(True,  True))
 
+        # checkbox interaction — PySide6 proxy doesn't relay CheckStateRole
+        # through the delegate reliably, so we toggle manually on click / Space
+        self._table.clicked.connect(self._on_row_clicked)
+        self._table.installEventFilter(self)
+
     def load(self):
         """Call every time this screen becomes active."""
         senders = self._state.senders
@@ -1017,6 +1220,30 @@ class SendersScreen(QWidget):
         on = n > 0
         for b in (self._unsub_btn, self._delete_btn, self._both_btn):
             b.setEnabled(on)
+
+    # ── checkbox interaction helpers ─────────────────────────────────
+    def _toggle_row(self, proxy_index: QModelIndex):
+        """Toggle the checkbox for the row at proxy_index (any column)."""
+        if not self._model or not self._proxy:
+            return
+        chk_proxy = self._proxy.index(proxy_index.row(), SenderTableModel.COL_CHK)
+        src = self._proxy.mapToSource(chk_proxy)
+        curr = self._model.data(src, Qt.CheckStateRole)
+        new_val = Qt.Unchecked if curr == Qt.Checked else Qt.Checked
+        self._model.setData(src, new_val, Qt.CheckStateRole)
+
+    def _on_row_clicked(self, proxy_index: QModelIndex):
+        self._toggle_row(proxy_index)
+
+    def eventFilter(self, obj, event):
+        """Space bar toggles the checkbox on the current row."""
+        if obj == self._table and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key_Space:
+                idx = self._table.currentIndex()
+                if idx.isValid():
+                    self._toggle_row(idx)
+                    return True
+        return super().eventFilter(obj, event)
 
     def _confirm_action(self, do_unsub: bool, do_delete: bool):
         if not self._model:
@@ -1293,6 +1520,11 @@ QFrame#card {
     background-color: #ffffff;
     border-radius: 14px;
     border: 1px solid #e2e8f0;
+}
+QFrame#acctRow {
+    background-color: #f8fafc;
+    border: 1.5px solid #e2e8f0;
+    border-radius: 8px;
 }
 QLabel#title {
     font-size: 22px;
