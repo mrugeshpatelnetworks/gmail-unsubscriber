@@ -81,30 +81,31 @@ cd gmail-unsubscriber
 
 ---
 
-## Step 2 — Install dependencies
+## Step 2 — Install and launch
+
+No manual setup needed — the launcher scripts install Python and all dependencies automatically if they are missing.
 
 ### Windows
-Double-click **`setup.bat`** — installs everything and launches the app automatically.
+Double-click **`setup.bat`**
 
-Or manually:
-```cmd
-pip install -r requirements.txt
-python gmail_unsubscriber.py
-```
+That's it. It will:
+1. Detect Python — install it automatically via winget or python.org if missing
+2. Install all Python dependencies
+3. Launch the app
 
-### Mac / Linux
+### Mac — double-click (no Terminal needed)
+Double-click **`setup.command`** in Finder.
+
+> First time only: right-click → **Open** → **Open** (macOS security prompt)
+
+It will install Homebrew + Python automatically if missing, then launch the app.
+
+### Mac / Linux — Terminal
 ```bash
-pip3 install -r requirements.txt
-python3 gmail_unsubscriber.py
+bash setup.sh
 ```
 
-Or with a virtual environment:
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python gmail_unsubscriber.py
-```
+It auto-detects your OS and installs Python via `brew`, `apt`, `dnf`, or `pacman` if needed.
 
 ---
 
@@ -304,7 +305,9 @@ Some senders require you to click a confirm button on their page. Complete the s
 gmail-unsubscriber/
 ├── gmail_unsubscriber.py   # main app (PySide6 GUI)
 ├── requirements.txt        # Python dependencies
-├── setup.bat               # Windows one-click launcher
+├── setup.bat               # Windows  — double-click to install + launch
+├── setup.command           # Mac      — double-click in Finder to install + launch
+├── setup.sh                # Linux    — run in terminal to install + launch
 ├── .gitignore              # excludes credentials and token
 └── README.md               # this file
 
