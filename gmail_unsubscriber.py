@@ -1226,12 +1226,11 @@ class SendersScreen(QWidget):
         abar.addWidget(self._sel_lbl)
         abar.addStretch()
 
-        self._unsub_btn  = QPushButton("Unsubscribe")
-        self._delete_btn = QPushButton("Delete Unread")
-        self._both_btn   = QPushButton("Both ✓")
+        self._unsub_btn = QPushButton("Unsubscribe")
+        self._both_btn  = QPushButton("Unsubscribe + Delete")
         self._both_btn.setObjectName("primary_strong")
 
-        for b in (self._unsub_btn, self._delete_btn, self._both_btn):
+        for b in (self._unsub_btn, self._both_btn):
             b.setEnabled(False)
             b.setFixedHeight(40)
             abar.addWidget(b)
@@ -1242,9 +1241,8 @@ class SendersScreen(QWidget):
         self._filter.textChanged.connect(self._on_filter)
         sel_all.clicked.connect(lambda: self._toggle_all(True))
         clr.clicked.connect(lambda: self._toggle_all(False))
-        self._unsub_btn.clicked.connect( lambda: self._confirm_action(True,  False))
-        self._delete_btn.clicked.connect(lambda: self._confirm_action(False, True))
-        self._both_btn.clicked.connect(  lambda: self._confirm_action(True,  True))
+        self._unsub_btn.clicked.connect(lambda: self._confirm_action(True, False))
+        self._both_btn.clicked.connect( lambda: self._confirm_action(True, True))
 
         # checkbox interaction — PySide6 proxy doesn't relay CheckStateRole
         # through the delegate reliably, so we toggle manually on click / Space
@@ -1294,7 +1292,7 @@ class SendersScreen(QWidget):
         n = self._model.checked_count()
         self._sel_lbl.setText(f"{n} selected")
         on = n > 0
-        for b in (self._unsub_btn, self._delete_btn, self._both_btn):
+        for b in (self._unsub_btn, self._both_btn):
             b.setEnabled(on)
 
     # ── checkbox interaction helpers ─────────────────────────────────
