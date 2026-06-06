@@ -6,10 +6,9 @@ Thread-safe scanning via QThread + Signal/Slot | QStackedWidget navigation
 """
 
 # ── Standard library ──────────────────────────────────────────────────────────
-import os, sys, re, imaplib, smtplib, webbrowser, pickle, base64
+import os, sys, re, imaplib, email as _email_lib, webbrowser, pickle, base64
 from pathlib import Path
 from dataclasses import dataclass, field
-from email.mime.text import MIMEText
 from email.header import decode_header as _mime_decode
 from collections import defaultdict
 from typing import Optional
@@ -44,8 +43,6 @@ APP_NAME     = "Gmail Unsubscriber"
 APP_VERSION  = "2.0"
 IMAP_HOST    = "imap.gmail.com"
 IMAP_PORT    = 993
-SMTP_HOST    = "smtp.gmail.com"
-SMTP_PORT    = 587
 CREDS_FILE   = Path(__file__).parent / "credentials.json"
 TOKEN_FILE   = Path(__file__).parent / "token.pickle"
 OAUTH_SCOPES = [
@@ -126,6 +123,102 @@ def _parse_unsub(value: str) -> Optional[dict]:
         return None
     return {"mailto": mailto[0] if mailto else None,
             "http":   http[0]   if http   else None}
+
+
+def _extract_body_unsub_url(body: str) -> Optional[str]:
+    """
+    Scan an email body (HTML or plain text) for an unsubscribe URL.
+    Returns the first URL whose href or link-text matches unsubscribe keywords.
+    """
+    # Decode common HTML entities so regex sees clean URLs
+    body = body.replace("&amp;", "&").replace("&#38;", "&") \
+               .replace("&lt;", "<").replace("&gt;", ">")
+
+    KEYWORDS = re.compile(
+        r'unsub|opt.?out|manage.{0,20}pref|remove.{0,20}list|email.{0,20}pref',
+        re.I)
+
+    # HTML <a href="...">link text</a>
+    for m in re.finditer(
+            r'<a[^>]+href=["\']([^"\'>\s]{8,})["\'][^>]*>(.*?)</a>',
+            body, re.I | re.S):
+        url  = m.group(1).strip()
+        text = re.sub(r'<[^>]+>', '', m.group(2)).strip()
+        if url.startswith("http") and KEYWORDS.search(url + " " + text):
+            return url
+
+    # Plain-text URLs (e.g. in text/plain part or unlinked HTML)
+    for url in re.findall(r'https?://[^\s<>"\']{8,}', body):
+        if KEYWORDS.search(url):
+            return url
+
+    return None
+
+
+def _find_body_unsub_link(mail, sender_email: str) -> Optional[str]:
+    """
+    Fetch the most recent email from sender_email via IMAP, parse its body,
+    and return the first unsubscribe URL found — or None.
+    """
+    try:
+        mail.select('"[Gmail]/All Mail"', readonly=True)
+        typ, data = mail.uid("SEARCH", "CHARSET", "UTF-8",
+                             "FROM", f'"{sender_email}"')
+        if typ != "OK" or not data or not data[0]:
+            return None
+        uids = data[0].split()
+        if not uids:
+            return None
+
+        # Use the most recent email from this sender
+        uid = uids[-1].decode()
+        typ, msg_data = mail.uid("FETCH", uid, "(RFC822)")
+        if typ != "OK" or not msg_data:
+            return None
+
+        raw = next((i[1] for i in msg_data if isinstance(i, tuple) and len(i) >= 2), None)
+        if not raw:
+            return None
+
+        # Parse with Python's email library for proper MIME handling
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8", errors="replace")
+        msg = _email_lib.message_from_bytes(raw)
+
+        html_body, text_body = "", ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                try:
+                    payload = part.get_payload(decode=True)
+                    if not payload:
+                        continue
+                    decoded = payload.decode(
+                        part.get_content_charset() or "utf-8", errors="replace")
+                    if ct == "text/html"  and not html_body:
+                        html_body = decoded
+                    elif ct == "text/plain" and not text_body:
+                        text_body = decoded
+                except Exception:
+                    continue
+        else:
+            try:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    decoded = payload.decode(
+                        msg.get_content_charset() or "utf-8", errors="replace")
+                    if msg.get_content_type() == "text/html":
+                        html_body = decoded
+                    else:
+                        text_body = decoded
+            except Exception:
+                pass
+
+        # HTML usually has proper href links; try it first
+        return (_extract_body_unsub_url(html_body) or
+                _extract_body_unsub_url(text_body))
+    except Exception:
+        return None
 
 
 def _detect_gmail_env_accounts() -> list:
@@ -344,43 +437,26 @@ class ActionWorker(QThread):
             # ── Unsubscribe ──────────────────────────────────────────
             if self._do_unsub:
                 unsub = sender.unsubscribe
-                sent  = False
-                if unsub and unsub.get("mailto"):
+                url   = None
+
+                # 1. HTTP link from List-Unsubscribe header (instant, no fetch needed)
+                if unsub and unsub.get("http"):
+                    url = unsub["http"]
+
+                # 2. No header link — fetch one real email body and extract the link
+                if not url:
                     for acct in sender.accounts:
                         if acct in self._imap_conns:
-                            _, pwd = self._imap_conns[acct]
-                            try:
-                                m2 = re.match(r"mailto:([^?]+)(?:\?(.*))?", unsub["mailto"], re.I)
-                                if m2:
-                                    to_addr = m2.group(1).strip()
-                                    prms = {}
-                                    if m2.group(2):
-                                        for kv in m2.group(2).split("&"):
-                                            if "=" in kv:
-                                                k, v = kv.split("=", 1)
-                                                prms[k.lower()] = v.replace("+", " ")
-                                    msg = MIMEText(prms.get("body", "Please unsubscribe me."))
-                                    msg["From"]    = acct
-                                    msg["To"]      = to_addr
-                                    msg["Subject"] = prms.get("subject", "Unsubscribe")
-                                    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
-                                        smtp.ehlo(); smtp.starttls()
-                                        smtp.login(acct, pwd)
-                                        smtp.sendmail(acct, to_addr, msg.as_string())
-                                    sent = True
-                                    break
-                            except Exception:
-                                continue
+                            conn, _ = self._imap_conns[acct]
+                            url = _find_body_unsub_link(conn, sender.email)
+                            if url:
+                                break
 
-                if sent:
-                    self.item_done.emit(sender.email, "ok", "Unsubscribe email sent")
-                elif unsub and unsub.get("http"):
-                    webbrowser.open(unsub["http"])
-                    self.item_done.emit(sender.email, "web", "Opened in browser")
-                elif unsub:
-                    self.item_done.emit(sender.email, "fail", "No usable method")
+                if url:
+                    webbrowser.open(url)
+                    self.item_done.emit(sender.email, "ok", "Unsubscribe link opened in browser")
                 else:
-                    self.item_done.emit(sender.email, "fail", "No unsubscribe link")
+                    self.item_done.emit(sender.email, "fail", "No unsubscribe link found")
 
             # ── Delete unread ────────────────────────────────────────
             if self._do_delete:
@@ -1411,9 +1487,9 @@ class ResultsScreen(QWidget):
 
     def load(self):
         st = self._state
-        self._ok_lbl.setText( f"  ✓  {len(st.unsub_ok)}  unsubscribe emails sent automatically")
-        self._web_lbl.setText(f"  ↗  {len(st.unsub_web)} unsubscribe pages opened in browser")
-        self._fail_lbl.setText(f"  ✗  {len(st.unsub_fail)} failed")
+        self._ok_lbl.setText(  f"  ✓  {len(st.unsub_ok)}  unsubscribe links opened in browser")
+        self._web_lbl.setVisible(False)
+        self._fail_lbl.setText(f"  ✗  {len(st.unsub_fail)}  no unsubscribe link found")
         self._del_lbl.setText( f"  🗑  {st.deleted_count}  unread emails moved to Trash")
 
         self._ok_lbl.setStyleSheet  ("color: #22c55e; font-size: 15px;")
