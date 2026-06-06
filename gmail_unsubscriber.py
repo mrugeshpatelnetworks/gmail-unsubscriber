@@ -410,7 +410,13 @@ class ScanWorker(QThread):
 
                 self.progress.emit(min(i + 50, total), total, last)
 
-            result = sorted(senders.values(), key=lambda s: s.count, reverse=True)
+            # Only surface senders that actually have an unsubscribe link —
+            # senders with no List-Unsubscribe header are transactional
+            # (receipts, notifications) and can't be unsubscribed from.
+            result = sorted(
+                (s for s in senders.values() if s.unsubscribe),
+                key=lambda s: s.count, reverse=True,
+            )
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
@@ -1055,7 +1061,7 @@ class ScanningScreen(QWidget):
             "font-size: 48px; font-weight: 700; color: #4361ee;")
         cl.addWidget(self._found_lbl)
 
-        cl.addWidget(_sub("unique senders found"))
+        cl.addWidget(_sub("senders with unsubscribe link found"))
 
         cl.addWidget(_sub("Recently found:"))
         self._recent = QListWidget()
