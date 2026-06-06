@@ -458,31 +458,26 @@ class ActionWorker(QThread):
                 else:
                     self.item_done.emit(sender.email, "fail", "No unsubscribe link found")
 
-            # ── Delete unread ────────────────────────────────────────
+            # ── Delete ALL emails from this sender (read + unread) ──
             if self._do_delete:
-                by_acct: dict = defaultdict(list)
                 for acct in sender.accounts:
-                    by_acct[acct].append(sender.email)
-
-                for acct, emails in by_acct.items():
                     if acct not in self._imap_conns:
                         continue
                     mail, _ = self._imap_conns[acct]
                     try:
                         mail.select('"[Gmail]/All Mail"', readonly=False)
-                        for ea in emails:
-                            typ, data = mail.uid("SEARCH", "CHARSET", "UTF-8",
-                                                  "UNSEEN", "FROM", f'"{ea}"')
-                            if typ != "OK" or not data or not data[0]:
-                                continue
-                            uids = data[0].split()
-                            for i in range(0, len(uids), 100):
-                                batch   = uids[i:i+100]
-                                uid_str = ",".join(u.decode() for u in batch)
-                                mail.uid("COPY",  uid_str, '"[Gmail]/Trash"')
-                                mail.uid("STORE", uid_str, "+FLAGS", "(\\Deleted)")
-                                total_deleted += len(batch)
-                            mail.expunge()
+                        typ, data = mail.uid("SEARCH", "CHARSET", "UTF-8",
+                                             "FROM", f'"{sender.email}"')
+                        if typ != "OK" or not data or not data[0]:
+                            continue
+                        uids = data[0].split()
+                        for i in range(0, len(uids), 100):
+                            batch   = uids[i:i+100]
+                            uid_str = ",".join(u.decode() for u in batch)
+                            mail.uid("COPY",  uid_str, '"[Gmail]/Trash"')
+                            mail.uid("STORE", uid_str, "+FLAGS", "(\\Deleted)")
+                            total_deleted += len(batch)
+                        mail.expunge()
                     except Exception:
                         pass
 
@@ -1326,8 +1321,8 @@ class SendersScreen(QWidget):
         if not checked:
             return
         actions = []
-        if do_unsub:  actions.append("• Send unsubscribe requests")
-        if do_delete: actions.append("• Delete all unread emails from them")
+        if do_unsub:  actions.append("• Open unsubscribe link in browser")
+        if do_delete: actions.append("• Delete ALL emails from them (read + unread, across all of Gmail)")
         msg = (f"You selected {len(checked)} sender(s).\n\n"
                + "\n".join(actions)
                + "\n\nProceed?")
@@ -1488,7 +1483,7 @@ class ResultsScreen(QWidget):
         self._ok_lbl.setText(  f"  ✓  {len(st.unsub_ok)}  unsubscribe links opened in browser")
         self._web_lbl.setVisible(False)
         self._fail_lbl.setText(f"  ✗  {len(st.unsub_fail)}  no unsubscribe link found")
-        self._del_lbl.setText( f"  🗑  {st.deleted_count}  unread emails moved to Trash")
+        self._del_lbl.setText( f"  🗑  {st.deleted_count}  emails moved to Trash")
 
         self._ok_lbl.setStyleSheet  ("color: #22c55e; font-size: 15px;")
         self._web_lbl.setStyleSheet ("color: #f59e0b; font-size: 15px;")
