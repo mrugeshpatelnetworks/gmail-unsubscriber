@@ -114,15 +114,54 @@ def _parse_from(value: str) -> tuple:
     return v, v.lower()
 
 
-def _parse_unsub(value: str) -> Optional[dict]:
+def _parse_unsub(value: str, post_value: str = "") -> Optional[dict]:
     if not value:
         return None
     mailto = re.findall(r"<(mailto:[^>]+)>", value, re.I)
     http   = re.findall(r"<(https?://[^>]+)>", value, re.I)
     if not mailto and not http:
         return None
-    return {"mailto": mailto[0] if mailto else None,
-            "http":   http[0]   if http   else None}
+    one_click = bool(post_value and
+                     "list-unsubscribe=one-click" in post_value.lower())
+    return {"mailto":    mailto[0] if mailto else None,
+            "http":      http[0]   if http   else None,
+            "one_click": one_click}
+
+
+def _http_unsubscribe(url: str, one_click: bool = False) -> tuple:
+    """
+    Silently unsubscribe via background HTTP request (no browser).
+    - RFC 8058 one-click POST when one_click=True
+    - Plain GET request otherwise
+    Returns (success: bool, message: str).
+    """
+    import urllib.request, urllib.error
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GmailUnsubscriber/1.0)",
+        "Accept":     "text/html,application/xhtml+xml,*/*",
+    }
+    try:
+        if one_click:
+            data = b"List-Unsubscribe=One-Click"
+            req  = urllib.request.Request(
+                url, data=data,
+                headers={**headers,
+                         "Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+        else:
+            req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            code = resp.getcode()
+            if 200 <= code < 400:
+                return (True, f"{'POST' if one_click else 'GET'} {code}")
+            return (False, f"HTTP {code}")
+    except urllib.error.HTTPError as exc:
+        if 200 <= exc.code < 400:          # some servers return 2xx via HTTPError
+            return (True, f"HTTP {exc.code}")
+        return (False, f"HTTP error {exc.code}")
+    except Exception as exc:
+        return (False, str(exc)[:80])
 
 
 def _extract_body_unsub_url(body: str) -> Optional[str]:
@@ -370,7 +409,7 @@ class ScanWorker(QThread):
                 try:
                     typ, msg_data = self._mail.uid(
                         "FETCH", uid_str,
-                        "(BODY.PEEK[HEADER.FIELDS (FROM LIST-UNSUBSCRIBE)])"
+                        "(BODY.PEEK[HEADER.FIELDS (FROM LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)])"
                     )
                 except Exception:
                     self.progress.emit(min(i + 50, total), total, "")
@@ -386,19 +425,28 @@ class ScanWorker(QThread):
                     raw = item[1]
                     if isinstance(raw, bytes):
                         raw = raw.decode("utf-8", errors="replace")
-                    from_val = unsub_val = ""
+                    from_val = unsub_val = unsub_post_val = ""
+                    _last_hdr = ""
                     for line in raw.splitlines():
                         ll = line.lower()
                         if ll.startswith("from:"):
-                            from_val = line[5:].strip()
+                            from_val  = line[5:].strip()
+                            _last_hdr = "from"
+                        elif ll.startswith("list-unsubscribe-post:"):
+                            unsub_post_val = line[22:].strip()
+                            _last_hdr = "post"
                         elif ll.startswith("list-unsubscribe:"):
                             unsub_val = line[17:].strip()
-                        elif line.startswith((" ", "\t")) and unsub_val:
-                            unsub_val += " " + line.strip()
+                            _last_hdr = "unsub"
+                        elif line.startswith((" ", "\t")):
+                            if _last_hdr == "unsub":
+                                unsub_val      += " " + line.strip()
+                            elif _last_hdr == "post":
+                                unsub_post_val += " " + line.strip()
                     if not from_val:
                         continue
                     name, ea = _parse_from(from_val)
-                    unsub    = _parse_unsub(unsub_val)
+                    unsub    = _parse_unsub(unsub_val, unsub_post_val)
                     if ea not in senders:
                         senders[ea] = Sender(email=ea, name=name, count=1,
                                               unsubscribe=unsub, accounts=[self._acct])
@@ -459,8 +507,20 @@ class ActionWorker(QThread):
                                 break
 
                 if url:
-                    webbrowser.open(url)
-                    self.item_done.emit(sender.email, "ok", "Unsubscribe link opened in browser")
+                    one_click = bool(unsub and unsub.get("one_click"))
+                    ok, msg   = _http_unsubscribe(url, one_click=one_click)
+                    if ok:
+                        self.item_done.emit(sender.email, "ok",
+                                            f"Unsubscribed silently ({msg})")
+                    else:
+                        # HTTP failed — fall back to opening the browser
+                        try:
+                            webbrowser.open(url)
+                            self.item_done.emit(sender.email, "web",
+                                                f"Opened in browser (HTTP failed: {msg})")
+                        except Exception as exc:
+                            self.item_done.emit(sender.email, "fail",
+                                                f"Failed: {msg} / browser: {exc}")
                 else:
                     self.item_done.emit(sender.email, "fail", "No unsubscribe link found")
 
@@ -1486,8 +1546,9 @@ class ResultsScreen(QWidget):
 
     def load(self):
         st = self._state
-        self._ok_lbl.setText(  f"  ✓  {len(st.unsub_ok)}  unsubscribe links opened in browser")
-        self._web_lbl.setVisible(False)
+        self._ok_lbl.setText(  f"  ✓  {len(st.unsub_ok)}  unsubscribed silently in background")
+        self._web_lbl.setText( f"  ↗  {len(st.unsub_web)}  opened in browser (fallback)")
+        self._web_lbl.setVisible(bool(st.unsub_web))
         self._fail_lbl.setText(f"  ✗  {len(st.unsub_fail)}  no unsubscribe link found")
         self._del_lbl.setText( f"  🗑  {st.deleted_count}  emails moved to Trash")
 
