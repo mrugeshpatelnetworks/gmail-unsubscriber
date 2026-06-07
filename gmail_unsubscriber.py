@@ -128,40 +128,283 @@ def _parse_unsub(value: str, post_value: str = "") -> Optional[dict]:
             "one_click": one_click}
 
 
+def _find_confirm_in_html(base_url: str, html: str) -> Optional[tuple]:
+    """
+    After visiting an unsubscribe URL, inspect the returned HTML for a
+    confirmation step that still needs to be taken (form submit or link click).
+    Returns (method, url, post_data_dict) or None if page looks done already.
+    """
+    from urllib.parse import urljoin
+
+    CONFIRM_KW = re.compile(
+        r'confirm|unsubscrib|opt.?out|yes|remove|click\s+here', re.I)
+    SKIP_KW    = re.compile(
+        r'privacy|terms|cookie|home|login|signup|cancel|back', re.I)
+
+    # ── 1. <form> with a confirm/submit button ────────────────────────────────
+    for form_m in re.finditer(r'<form([^>]*)>(.*?)</form>', html, re.I | re.S):
+        attrs_str = form_m.group(1)
+        form_body = form_m.group(2)
+
+        action_m = re.search(r'action=["\']([^"\']*)["\']', attrs_str, re.I)
+        action   = urljoin(base_url, action_m.group(1)) if action_m else base_url
+        if SKIP_KW.search(action):
+            continue
+
+        method_m = re.search(r'method=["\'](\w+)["\']', attrs_str, re.I)
+        method   = method_m.group(1).upper() if method_m else "POST"
+
+        has_confirm_btn = False
+        for btn_m in re.finditer(
+                r'<(?:input|button)([^>]*)>([^<]*)', form_body, re.I | re.S):
+            btn_attrs = btn_m.group(1)
+            btn_text  = btn_m.group(2).strip()
+            if 'submit' not in btn_attrs.lower() and 'submit' not in btn_text.lower():
+                continue
+            val_m    = re.search(r'value=["\']([^"\']*)["\']', btn_attrs, re.I)
+            val_text = val_m.group(1) if val_m else ""
+            combined = (btn_text + " " + val_text).strip()
+            if CONFIRM_KW.search(combined) or not combined:
+                has_confirm_btn = True
+                break
+
+        if has_confirm_btn:
+            post_data = {}
+            for inp_m in re.finditer(
+                    r'<input[^>]+name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']',
+                    form_body, re.I):
+                post_data[inp_m.group(1)] = inp_m.group(2)
+            return (method, action, post_data)
+
+    # ── 2. Confirmation link ──────────────────────────────────────────────────
+    for link_m in re.finditer(
+            r'<a[^>]+href=["\']([^"\'>\s]{8,})["\'][^>]*>(.*?)</a>',
+            html, re.I | re.S):
+        href = link_m.group(1).strip()
+        text = re.sub(r'<[^>]+>', '', link_m.group(2)).strip()
+        if not href.startswith('http'):
+            href = urljoin(base_url, href)
+        if CONFIRM_KW.search(text + " " + href) and not SKIP_KW.search(href):
+            return ("GET", href, {})
+
+    return None
+
+
 def _http_unsubscribe(url: str, one_click: bool = False) -> tuple:
     """
-    Silently unsubscribe via background HTTP request (no browser).
-    - RFC 8058 one-click POST when one_click=True
-    - Plain GET request otherwise
+    Silently unsubscribe via background HTTP.
+    - RFC 8058 one-click POST if one_click=True, plain GET otherwise.
+    - If the response page contains a confirmation form/link, auto-follows it.
     Returns (success: bool, message: str).
     """
     import urllib.request, urllib.error
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; GmailUnsubscriber/1.0)",
-        "Accept":     "text/html,application/xhtml+xml,*/*",
+    from urllib.parse import urlencode
+
+    _HDR = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0.0.0 Safari/537.36"),
+        "Accept":          "text/html,application/xhtml+xml,*/*;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
     }
-    try:
-        if one_click:
-            data = b"List-Unsubscribe=One-Click"
-            req  = urllib.request.Request(
-                url, data=data,
-                headers={**headers,
-                         "Content-Type": "application/x-www-form-urlencoded"},
-                method="POST",
-            )
+
+    def _req(method, target, post_data=None, referer=None):
+        hdrs = dict(_HDR)
+        if referer:
+            hdrs["Referer"] = referer
+        if post_data is not None:
+            body = (urlencode(post_data).encode()
+                    if isinstance(post_data, dict) else post_data)
+            hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+            r = urllib.request.Request(target, data=body, headers=hdrs, method=method)
         else:
-            req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            code = resp.getcode()
-            if 200 <= code < 400:
-                return (True, f"{'POST' if one_click else 'GET'} {code}")
+            r = urllib.request.Request(target, headers=hdrs)
+        with urllib.request.urlopen(r, timeout=15) as resp:
+            code      = resp.getcode()
+            final_url = resp.geturl()
+            ct        = resp.headers.get("Content-Type", "")
+            html      = (resp.read(65536).decode("utf-8", errors="replace")
+                         if "text/html" in ct else "")
+            return code, final_url, html
+
+    try:
+        # Step 1 — initial unsubscribe request
+        if one_click:
+            code, final_url, html = _req("POST", url,
+                                         post_data=b"List-Unsubscribe=One-Click")
+            label = "POST"
+        else:
+            code, final_url, html = _req("GET", url)
+            label = "GET"
+
+        if not (200 <= code < 400):
             return (False, f"HTTP {code}")
+
+        # Step 2 — auto-follow a confirmation page if one is present
+        if html:
+            confirm = _find_confirm_in_html(final_url, html)
+            if confirm:
+                c_method, c_url, c_data = confirm
+                try:
+                    c_code, _, _ = _req(
+                        c_method, c_url,
+                        post_data=c_data if c_method == "POST" else None,
+                        referer=final_url,
+                    )
+                    return (True, f"{label} {code} → confirm {c_method} {c_code}")
+                except Exception as exc:
+                    # Confirm step failed but initial was fine — still unsubscribed
+                    return (True, f"{label} {code} (confirm err: {str(exc)[:40]})")
+
+        return (True, f"{label} {code}")
+
     except urllib.error.HTTPError as exc:
-        if 200 <= exc.code < 400:          # some servers return 2xx via HTTPError
+        if 200 <= exc.code < 400:
             return (True, f"HTTP {exc.code}")
         return (False, f"HTTP error {exc.code}")
     except Exception as exc:
         return (False, str(exc)[:80])
+
+
+def _extract_confirm_url(body: str) -> Optional[str]:
+    """
+    Find a confirmation URL inside the body of a 'confirm your unsubscribe'
+    email.  Looks for links whose href or visible text contains confirm/verify
+    keywords (distinct from the unsubscribe keywords used in _extract_body_unsub_url).
+    """
+    body = body.replace("&amp;", "&").replace("&#38;", "&")
+    CONFIRM_KW = re.compile(
+        r'confirm|verif|yes.*unsub|click.*here|complet', re.I)
+    for m in re.finditer(
+            r'<a[^>]+href=["\']([^"\'>\s]{8,})["\'][^>]*>(.*?)</a>',
+            body, re.I | re.S):
+        url  = m.group(1).strip()
+        text = re.sub(r'<[^>]+>', '', m.group(2)).strip()
+        if url.startswith("http") and CONFIRM_KW.search(url + " " + text):
+            return url
+    for url in re.findall(r'https?://[^\s<>"\']{8,}', body):
+        if CONFIRM_KW.search(url):
+            return url
+    return None
+
+
+def _check_confirm_emails(mail, sender_emails: set, since_epoch: float) -> dict:
+    """
+    Search INBOX for 'confirm your unsubscribe' emails received after
+    since_epoch (unix timestamp) from any address in sender_emails.
+    Returns {sender_email: confirm_url} for each found.
+    """
+    import time, datetime
+    from email.utils import parsedate_to_datetime
+
+    results    = {}
+    CONFIRM_KW = re.compile(r'confirm|verif|unsubscrib', re.I)
+
+    try:
+        mail.select("INBOX", readonly=True)
+        since_dt  = datetime.datetime.fromtimestamp(since_epoch,
+                                                    tz=datetime.timezone.utc)
+        date_str  = since_dt.strftime("%d-%b-%Y")
+        typ, data = mail.uid("SEARCH", "SINCE", date_str)
+        if typ != "OK" or not data or not data[0]:
+            return results
+        uids = data[0].split()
+        if not uids:
+            return results
+
+        # Inspect at most the 100 most-recent messages
+        uid_str = ",".join(u.decode() for u in uids[-100:])
+        typ, msg_data = mail.uid(
+            "FETCH", uid_str,
+            "(UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])"
+        )
+        if typ != "OK":
+            return results
+
+        candidates = []   # [(uid_str, sender_email)]
+        for item in msg_data:
+            if not isinstance(item, tuple) or len(item) < 2:
+                continue
+            envelope = (item[0].decode() if isinstance(item[0], bytes)
+                        else str(item[0]))
+            body_raw = (item[1].decode("utf-8", errors="replace")
+                        if isinstance(item[1], bytes) else item[1])
+
+            uid_m = re.search(r'UID\s+(\d+)', envelope, re.I)
+            if not uid_m:
+                continue
+            uid_val = uid_m.group(1)
+
+            from_val = subj_val = date_val = ""
+            for line in body_raw.splitlines():
+                ll = line.lower()
+                if ll.startswith("from:"):    from_val = line[5:].strip()
+                elif ll.startswith("subject:"): subj_val = line[8:].strip()
+                elif ll.startswith("date:"):   date_val = line[5:].strip()
+
+            if not from_val:
+                continue
+
+            # Skip emails that arrived before our job started
+            try:
+                if parsedate_to_datetime(date_val).timestamp() < since_epoch:
+                    continue
+            except Exception:
+                pass  # unparseable date — include anyway
+
+            _, from_email = _parse_from(from_val)
+            if from_email in sender_emails and CONFIRM_KW.search(subj_val):
+                candidates.append((uid_val, from_email))
+
+        # Fetch full RFC822 of each candidate and extract the confirm URL
+        for uid_val, from_email in candidates:
+            if from_email in results:
+                continue
+            typ, full = mail.uid("FETCH", uid_val, "(RFC822)")
+            if typ != "OK" or not full:
+                continue
+            raw = next((i[1] for i in full
+                        if isinstance(i, tuple) and len(i) >= 2), None)
+            if not raw:
+                continue
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8", errors="replace")
+
+            msg = _email_lib.message_from_bytes(raw)
+            html_body = text_body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ct = part.get_content_type()
+                    try:
+                        payload = part.get_payload(decode=True)
+                        if not payload:
+                            continue
+                        dec = payload.decode(
+                            part.get_content_charset() or "utf-8", errors="replace")
+                        if ct == "text/html"  and not html_body: html_body = dec
+                        elif ct == "text/plain" and not text_body: text_body = dec
+                    except Exception:
+                        continue
+            else:
+                try:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        dec = payload.decode(
+                            msg.get_content_charset() or "utf-8", errors="replace")
+                        if msg.get_content_type() == "text/html": html_body = dec
+                        else: text_body = dec
+                except Exception:
+                    pass
+
+            confirm_url = (_extract_confirm_url(html_body) or
+                           _extract_confirm_url(text_body))
+            if confirm_url:
+                results[from_email] = confirm_url
+
+    except Exception:
+        pass
+
+    return results
 
 
 def _extract_body_unsub_url(body: str) -> Optional[str]:
@@ -484,8 +727,11 @@ class ActionWorker(QThread):
         self._do_delete  = do_delete
 
     def run(self):
+        import time as _time
         total         = len(self._senders)
         total_deleted = 0
+        job_started   = _time.time()    # timestamp used for confirmation-email scan
+        unsub_ok_set  = set()           # senders we successfully unsubscribed
 
         for idx, sender in enumerate(self._senders):
             # ── Unsubscribe ──────────────────────────────────────────
@@ -510,6 +756,7 @@ class ActionWorker(QThread):
                     one_click = bool(unsub and unsub.get("one_click"))
                     ok, msg   = _http_unsubscribe(url, one_click=one_click)
                     if ok:
+                        unsub_ok_set.add(sender.email)
                         self.item_done.emit(sender.email, "ok",
                                             f"Unsubscribed silently ({msg})")
                     else:
@@ -548,6 +795,22 @@ class ActionWorker(QThread):
                         pass
 
             self.progress.emit(idx + 1, total)
+
+        # ── Confirmation-email sweep ──────────────────────────────────────────
+        # Some senders reply with a "click here to confirm your unsubscribe"
+        # email.  Wait briefly then scan INBOX and auto-click those links.
+        if self._do_unsub and unsub_ok_set and self._imap_conns:
+            _time.sleep(8)   # give servers time to send confirmation emails
+            for acct, (mail, _) in self._imap_conns.items():
+                confirms = _check_confirm_emails(mail, unsub_ok_set, job_started)
+                for sender_ea, confirm_url in confirms.items():
+                    ok, msg = _http_unsubscribe(confirm_url)
+                    if ok:
+                        self.item_done.emit(sender_ea, "confirm",
+                                            f"Confirm email clicked ({msg})")
+                    else:
+                        self.item_done.emit(sender_ea, "confirm",
+                                            f"Confirm email found but click failed: {msg}")
 
         self.finished.emit(total_deleted)
 
@@ -1464,14 +1727,15 @@ class ProcessingScreen(QWidget):
         self._worker.start()
 
     def _on_item(self, email: str, status: str, msg: str):
-        icon = {"ok": "✓", "web": "↗", "fail": "✗"}.get(status, "·")
+        icon = {"ok": "✓", "web": "↗", "fail": "✗", "confirm": "✉"}.get(status, "·")
         self._log.insertItem(0, f"  {icon}  {email}  —  {msg}")
         if status == "ok":
             self._state.unsub_ok.append(email)
         elif status == "web":
             self._state.unsub_web.append(email)
-        else:
+        elif status == "fail":
             self._state.unsub_fail.append(email)
+        # "confirm" = confirmation email clicked — already counted in unsub_ok; just log it
 
     def _on_progress(self, done: int, total: int):
         pct = int(done / total * 100) if total else 0
