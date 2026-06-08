@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gmail Unsubscriber — PySide6 Desktop App
+Email Unsubscriber — PySide6 Desktop App (Gmail + Yahoo)
 Council design: QTableView + QAbstractTableModel + QSortFilterProxyModel
 Thread-safe scanning via QThread + Signal/Slot | QStackedWidget navigation
 """
@@ -39,10 +39,8 @@ except ImportError:
     OAUTH_AVAILABLE = False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-APP_NAME     = "Gmail Unsubscriber"
+APP_NAME     = "Email Unsubscriber"
 APP_VERSION  = "2.0"
-IMAP_HOST    = "imap.gmail.com"
-IMAP_PORT    = 993
 CREDS_FILE   = Path(__file__).parent / "credentials.json"
 TOKEN_FILE   = Path(__file__).parent / "token.pickle"
 OAUTH_SCOPES = [
@@ -50,12 +48,53 @@ OAUTH_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.modify",
 ]
+# SCAN_MODES: (imap_search_flag, gmail_only_x_gm_raw_filter)
+# Folder is resolved at runtime via _get_scan_folder() — varies by provider.
 SCAN_MODES = {
-    "all_unread": ("UNSEEN", '"[Gmail]/All Mail"', None),
-    "all_mail":   ("ALL",    '"[Gmail]/All Mail"', None),
-    "promos":     ("ALL",    '"[Gmail]/All Mail"', "category:promotions"),
-    "inbox":      ("UNSEEN", "INBOX",              None),
+    "all_unread": ("UNSEEN", None),
+    "all_mail":   ("ALL",    None),
+    "promos":     ("ALL",    "category:promotions"),  # Gmail-only; Yahoo falls back to ALL
+    "inbox":      ("UNSEEN", None),
 }
+
+# ── Provider tables ────────────────────────────────────────────────────────────
+YAHOO_DOMAINS = {
+    "yahoo.com", "yahoo.co.uk", "yahoo.ca", "yahoo.com.au", "yahoo.co.in",
+    "yahoo.fr",  "yahoo.de",    "yahoo.es", "yahoo.it",     "yahoo.co.jp",
+    "ymail.com", "rocketmail.com",
+}
+GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
+SUPPORTED_DOMAINS = GMAIL_DOMAINS | YAHOO_DOMAINS
+
+
+def _is_yahoo(email: str) -> bool:
+    return email.lower().split("@")[-1] in YAHOO_DOMAINS
+
+
+def _get_imap_settings(email: str) -> tuple:
+    """Return (host, port) for the email provider."""
+    if _is_yahoo(email):
+        return ("imap.mail.yahoo.com", 993)
+    return ("imap.gmail.com", 993)
+
+
+def _get_scan_folder(acct_email: str, mode_key: str) -> str:
+    """Return the IMAP folder to SELECT when scanning for a given account/mode."""
+    if _is_yahoo(acct_email):
+        return "INBOX"           # Yahoo has no unified All Mail folder
+    if mode_key == "inbox":
+        return "INBOX"
+    return '"[Gmail]/All Mail"'
+
+
+def _get_all_mail_folder(acct_email: str) -> str:
+    """Folder that contains (virtually) all mail for this account."""
+    return "INBOX" if _is_yahoo(acct_email) else '"[Gmail]/All Mail"'
+
+
+def _get_trash_folder(acct_email: str) -> str:
+    """Trash / Deleted items folder name for this account."""
+    return "Trash" if _is_yahoo(acct_email) else '"[Gmail]/Trash"'
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -437,13 +476,15 @@ def _extract_body_unsub_url(body: str) -> Optional[str]:
     return None
 
 
-def _find_body_unsub_link(mail, sender_email: str) -> Optional[str]:
+def _find_body_unsub_link(mail, sender_email: str, acct_email: str = "") -> Optional[str]:
     """
     Fetch the most recent email from sender_email via IMAP, parse its body,
     and return the first unsubscribe URL found — or None.
+    acct_email is the signed-in account (used to pick the correct IMAP folder).
     """
     try:
-        mail.select('"[Gmail]/All Mail"', readonly=True)
+        folder = _get_all_mail_folder(acct_email)
+        mail.select(folder, readonly=True)
         typ, data = mail.uid("SEARCH", "CHARSET", "UTF-8",
                              "FROM", f'"{sender_email}"')
         if typ != "OK" or not data or not data[0]:
@@ -503,13 +544,15 @@ def _find_body_unsub_link(mail, sender_email: str) -> Optional[str]:
         return None
 
 
-def _detect_gmail_env_accounts() -> list:
+def _detect_env_accounts() -> list:
     """
-    Scan os.environ for Gmail credential pairs.
+    Scan os.environ for Gmail and Yahoo credential pairs.
     Recognises:
-      • GMAIL_EMAIL  /  GMAIL_PASSWORD  (+ _APP_PASSWORD, _APP_PASS, _PASS variants)
-      • GMAIL_EMAIL_1 / GMAIL_PASSWORD_1 … (indexed, up to _9)
-      • GOOGLE_EMAIL / GOOGLE_PASSWORD variants
+      • GMAIL_EMAIL / GMAIL_APP_PASSWORD   (+ _USER, _PASS variants)
+      • GMAIL_EMAIL_1 … GMAIL_EMAIL_9      (indexed)
+      • GOOGLE_EMAIL / GOOGLE_PASSWORD
+      • YAHOO_EMAIL / YAHOO_APP_PASSWORD   (+ _USER, _PASS variants)
+      • YAHOO_EMAIL_1 … YAHOO_EMAIL_9      (indexed)
     Returns [(email, password), ...] deduplicated by email (case-insensitive).
     """
     env   = os.environ
@@ -517,24 +560,23 @@ def _detect_gmail_env_accounts() -> list:
 
     def _push(e: str, p: str):
         e = e.strip()
-        if (e and p and e.lower() not in seen and
-                ("@gmail.com" in e.lower() or "@googlemail.com" in e.lower())):
+        domain = e.lower().split("@")[-1] if "@" in e else ""
+        if e and p and e.lower() not in seen and domain in SUPPORTED_DOMAINS:
             seen.add(e.lower())
             found.append((e, p.strip()))
 
-    E_KEYS = ["GMAIL_EMAIL", "GMAIL_USER", "GOOGLE_EMAIL"]
-    P_KEYS = ["GMAIL_APP_PASSWORD", "GMAIL_APP_PASS", "GMAIL_PASSWORD",
-              "GMAIL_PASS",         "GOOGLE_APP_PASSWORD", "GOOGLE_PASSWORD"]
+    # ── Gmail / Google ────────────────────────────────────────────────────────
+    G_E = ["GMAIL_EMAIL", "GMAIL_USER", "GOOGLE_EMAIL"]
+    G_P = ["GMAIL_APP_PASSWORD", "GMAIL_APP_PASS", "GMAIL_PASSWORD",
+           "GMAIL_PASS",         "GOOGLE_APP_PASSWORD", "GOOGLE_PASSWORD"]
 
-    # singular keys
-    for ek in E_KEYS:
+    for ek in G_E:
         if ek in env:
-            for pk in P_KEYS:
+            for pk in G_P:
                 if pk in env:
                     _push(env[ek], env[pk])
                     break
 
-    # indexed keys  GMAIL_EMAIL_1 / GMAIL_PASSWORD_1, …
     for i in range(1, 10):
         email = next(
             (env[k] for k in [f"GMAIL_EMAIL_{i}", f"GMAIL_USER_{i}",
@@ -544,6 +586,27 @@ def _detect_gmail_env_accounts() -> list:
         pwd = next(
             (env[k] for k in [f"GMAIL_APP_PASSWORD_{i}", f"GMAIL_APP_PASS_{i}",
                                f"GMAIL_PASSWORD_{i}",    f"GMAIL_PASS_{i}"] if k in env), "")
+        _push(email, pwd)
+
+    # ── Yahoo ─────────────────────────────────────────────────────────────────
+    Y_E = ["YAHOO_EMAIL", "YAHOO_USER"]
+    Y_P = ["YAHOO_APP_PASSWORD", "YAHOO_APP_PASS", "YAHOO_PASSWORD", "YAHOO_PASS"]
+
+    for ek in Y_E:
+        if ek in env:
+            for pk in Y_P:
+                if pk in env:
+                    _push(env[ek], env[pk])
+                    break
+
+    for i in range(1, 10):
+        email = next(
+            (env[k] for k in [f"YAHOO_EMAIL_{i}", f"YAHOO_USER_{i}"] if k in env), "")
+        if not email:
+            break
+        pwd = next(
+            (env[k] for k in [f"YAHOO_APP_PASSWORD_{i}", f"YAHOO_APP_PASS_{i}",
+                               f"YAHOO_PASSWORD_{i}",    f"YAHOO_PASS_{i}"] if k in env), "")
         _push(email, pwd)
 
     return found
@@ -563,17 +626,27 @@ class IMAPAuthWorker(QThread):
 
     def run(self):
         try:
-            conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+            host, port = _get_imap_settings(self._email)
+            conn = imaplib.IMAP4_SSL(host, port)
             conn.login(self._email, self._password)
             self.success.emit(self._email, conn)
         except imaplib.IMAP4.error as e:
-            self.error.emit(
-                f"Login failed: {e}\n\n"
-                "Common fixes:\n"
-                "• Gmail Settings → Forwarding and POP/IMAP → Enable IMAP\n"
-                "• 2-Step Verification must be ON for App Passwords\n"
-                "• Generate App Password at myaccount.google.com/apppasswords"
-            )
+            if _is_yahoo(self._email):
+                self.error.emit(
+                    f"Login failed: {e}\n\n"
+                    "Yahoo fixes:\n"
+                    "• Yahoo Mail Settings → Security → Allow apps that use less secure sign in\n"
+                    "• Or generate an App Password at login.yahoo.com → Account Security\n"
+                    "• Make sure IMAP is enabled in Yahoo Mail settings"
+                )
+            else:
+                self.error.emit(
+                    f"Login failed: {e}\n\n"
+                    "Gmail fixes:\n"
+                    "• Gmail Settings → Forwarding and POP/IMAP → Enable IMAP\n"
+                    "• 2-Step Verification must be ON for App Passwords\n"
+                    "• Generate App Password at myaccount.google.com/apppasswords"
+                )
         except Exception as e:
             self.error.emit(str(e))
 
@@ -624,13 +697,15 @@ class ScanWorker(QThread):
 
     def run(self):
         try:
-            search_flag, folder, gm_raw = SCAN_MODES[self._mode]
+            search_flag, gm_raw = SCAN_MODES[self._mode]
+            folder = _get_scan_folder(self._acct, self._mode)
             typ, _ = self._mail.select(folder, readonly=True)
             if typ != "OK":
                 self.error.emit(f"Cannot open folder {folder}")
                 return
 
-            if gm_raw:
+            # X-GM-RAW is a Gmail-only extension; skip it for Yahoo
+            if gm_raw and not _is_yahoo(self._acct):
                 typ, data = self._mail.uid("SEARCH", "CHARSET", "UTF-8", "X-GM-RAW", gm_raw)
             else:
                 typ, data = self._mail.uid("SEARCH", None, search_flag)
@@ -748,7 +823,7 @@ class ActionWorker(QThread):
                     for acct in sender.accounts:
                         if acct in self._imap_conns:
                             conn, _ = self._imap_conns[acct]
-                            url = _find_body_unsub_link(conn, sender.email)
+                            url = _find_body_unsub_link(conn, sender.email, acct_email=acct)
                             if url:
                                 break
 
@@ -778,7 +853,9 @@ class ActionWorker(QThread):
                         continue
                     mail, _ = self._imap_conns[acct]
                     try:
-                        mail.select('"[Gmail]/All Mail"', readonly=False)
+                        all_folder   = _get_all_mail_folder(acct)
+                        trash_folder = _get_trash_folder(acct)
+                        mail.select(all_folder, readonly=False)
                         typ, data = mail.uid("SEARCH", "CHARSET", "UTF-8",
                                              "FROM", f'"{sender.email}"')
                         if typ != "OK" or not data or not data[0]:
@@ -787,7 +864,7 @@ class ActionWorker(QThread):
                         for i in range(0, len(uids), 100):
                             batch   = uids[i:i+100]
                             uid_str = ",".join(u.decode() for u in batch)
-                            mail.uid("COPY",  uid_str, '"[Gmail]/Trash"')
+                            mail.uid("COPY",  uid_str, trash_folder)
                             mail.uid("STORE", uid_str, "+FLAGS", "(\\Deleted)")
                             total_deleted += len(batch)
                         mail.expunge()
@@ -963,7 +1040,7 @@ class AccountRow(QFrame):
 
         # email
         self._email_edit = QLineEdit(email)
-        self._email_edit.setPlaceholderText("you@gmail.com")
+        self._email_edit.setPlaceholderText("you@gmail.com  or  you@yahoo.com")
         lay.addWidget(self._email_edit)
 
         # password + show toggle
@@ -1032,7 +1109,7 @@ class SignInScreen(QWidget):
         method_grp = QGroupBox("Sign-in method")
         ml = QVBoxLayout(method_grp)
         self._oauth_rb = QRadioButton("Sign in with Google  (OAuth — recommended)")
-        self._imap_rb  = QRadioButton("App Password + IMAP  (supports multiple accounts)")
+        self._imap_rb  = QRadioButton("App Password + IMAP  (Gmail + Yahoo, multiple accounts)")
         self._oauth_rb.setChecked(True)
         ml.addWidget(self._oauth_rb)
         ml.addWidget(self._imap_rb)
@@ -1066,8 +1143,11 @@ class SignInScreen(QWidget):
         il.addLayout(add_lay)
 
         # app-password help link
-        hint = QLabel('<a href="https://myaccount.google.com/apppasswords">'
-                      'How to get an App Password ↗</a>')
+        hint = QLabel(
+            '<a href="https://myaccount.google.com/apppasswords">Gmail App Password ↗</a>'
+            '&nbsp;&nbsp;·&nbsp;&nbsp;'
+            '<a href="https://login.yahoo.com/account/security">Yahoo App Password ↗</a>'
+        )
         hint.setOpenExternalLinks(True)
         hint.setObjectName("sub")
         il.addWidget(hint)
@@ -1100,7 +1180,7 @@ class SignInScreen(QWidget):
 
     # ── env population ───────────────────────────────────────────────
     def _populate_env_accounts(self):
-        env_accts = _detect_gmail_env_accounts()
+        env_accts = _detect_env_accounts()
         if env_accts:
             n = len(env_accts)
             self._env_banner.setText(

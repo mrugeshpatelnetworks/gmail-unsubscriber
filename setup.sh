@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Gmail Unsubscriber — Mac/Linux Auto-Setup
+# Email Unsubscriber — Mac/Linux Auto-Setup (Gmail + Yahoo)
 # Works whether launched from terminal, double-clicked, or run from any directory.
 
 # ── Always run from the folder this script lives in ──────────────────────────
@@ -157,7 +157,7 @@ echo "       All dependencies installed!"
 # STEP 4 — Show detected credentials + launch
 # ─────────────────────────────────────────────
 echo ""
-echo "[4/4] Checking for saved Gmail credentials..."
+echo "[4/4] Checking for saved credentials (Gmail + Yahoo)..."
 
 FOUND_CREDS=0
 for VAR in GMAIL_EMAIL GMAIL_USER GOOGLE_EMAIL \
@@ -165,7 +165,15 @@ for VAR in GMAIL_EMAIL GMAIL_USER GOOGLE_EMAIL \
            GMAIL_USER_1  GMAIL_USER_2  GMAIL_USER_3; do
     VALUE="${!VAR:-}"
     if [ -n "$VALUE" ]; then
-        echo "       Found: $VALUE"
+        echo "       Gmail:  $VALUE"
+        FOUND_CREDS=1
+    fi
+done
+for VAR in YAHOO_EMAIL YAHOO_USER \
+           YAHOO_EMAIL_1 YAHOO_EMAIL_2 YAHOO_EMAIL_3; do
+    VALUE="${!VAR:-}"
+    if [ -n "$VALUE" ]; then
+        echo "       Yahoo:  $VALUE"
         FOUND_CREDS=1
     fi
 done
@@ -177,13 +185,18 @@ else
     echo "       You can enter them manually in the app, or add these to"
     echo "       ~/.zshrc (Mac) or ~/.bashrc (Linux) for auto-fill next time:"
     echo ""
-    echo "         export GMAIL_EMAIL=\"you@gmail.com\""
-    echo "         export GMAIL_APP_PASSWORD=\"xxxx xxxx xxxx xxxx\""
+    echo "         Gmail:"
+    echo "           export GMAIL_EMAIL=\"you@gmail.com\""
+    echo "           export GMAIL_APP_PASSWORD=\"xxxx xxxx xxxx xxxx\""
+    echo ""
+    echo "         Yahoo:"
+    echo "           export YAHOO_EMAIL=\"you@yahoo.com\""
+    echo "           export YAHOO_APP_PASSWORD=\"xxxx xxxx xxxx xxxx\""
 fi
 
 echo ""
 echo "============================================="
-echo "  Launching Gmail Unsubscriber..."
+echo "  Launching Email Unsubscriber..."
 echo "============================================="
 echo ""
 "$VENV_PYTHON" "$SCRIPT_DIR/gmail_unsubscriber.py"

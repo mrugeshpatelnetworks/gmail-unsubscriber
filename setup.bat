@@ -1,13 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
-title Gmail Unsubscriber Setup
+title Email Unsubscriber Setup
 
 :: ── Always run from the folder this .bat file lives in ──────────────────────
 cd /d "%~dp0"
 
 echo.
 echo =============================================
-echo   Gmail Unsubscriber - Windows Auto-Setup
+echo   Email Unsubscriber - Windows Auto-Setup
 echo =============================================
 echo.
 echo Running from: %CD%
@@ -137,26 +137,34 @@ echo        All dependencies installed!
 :: STEP 4 — Show detected credentials + launch
 :: ─────────────────────────────────────────────
 echo.
-echo [4/4] Checking for saved Gmail credentials...
+echo [4/4] Checking for saved credentials (Gmail + Yahoo)...
 set "FOUND_CREDS=0"
-if defined GMAIL_EMAIL      ( echo        Found: %GMAIL_EMAIL%   & set "FOUND_CREDS=1" )
-if defined GMAIL_EMAIL_1    ( echo        Found: %GMAIL_EMAIL_1% & set "FOUND_CREDS=1" )
-if defined GMAIL_EMAIL_2    ( echo        Found: %GMAIL_EMAIL_2% & set "FOUND_CREDS=1" )
-if defined GMAIL_EMAIL_3    ( echo        Found: %GMAIL_EMAIL_3% & set "FOUND_CREDS=1" )
-if defined GOOGLE_EMAIL     ( echo        Found: %GOOGLE_EMAIL%  & set "FOUND_CREDS=1" )
+if defined GMAIL_EMAIL      ( echo        Gmail:  %GMAIL_EMAIL%   & set "FOUND_CREDS=1" )
+if defined GMAIL_EMAIL_1    ( echo        Gmail:  %GMAIL_EMAIL_1% & set "FOUND_CREDS=1" )
+if defined GMAIL_EMAIL_2    ( echo        Gmail:  %GMAIL_EMAIL_2% & set "FOUND_CREDS=1" )
+if defined GMAIL_EMAIL_3    ( echo        Gmail:  %GMAIL_EMAIL_3% & set "FOUND_CREDS=1" )
+if defined GOOGLE_EMAIL     ( echo        Gmail:  %GOOGLE_EMAIL%  & set "FOUND_CREDS=1" )
+if defined YAHOO_EMAIL      ( echo        Yahoo:  %YAHOO_EMAIL%   & set "FOUND_CREDS=1" )
+if defined YAHOO_EMAIL_1    ( echo        Yahoo:  %YAHOO_EMAIL_1% & set "FOUND_CREDS=1" )
+if defined YAHOO_EMAIL_2    ( echo        Yahoo:  %YAHOO_EMAIL_2% & set "FOUND_CREDS=1" )
 if "%FOUND_CREDS%"=="1" (
     echo        These will be auto-filled in the app.
 ) else (
     echo        No saved credentials found.
     echo        You can enter them manually in the app, or run these once to save them:
     echo.
-    echo          setx GMAIL_EMAIL "you@gmail.com"
-    echo          setx GMAIL_APP_PASSWORD "xxxx xxxx xxxx xxxx"
+    echo          Gmail:
+    echo            setx GMAIL_EMAIL "you@gmail.com"
+    echo            setx GMAIL_APP_PASSWORD "xxxx xxxx xxxx xxxx"
+    echo.
+    echo          Yahoo:
+    echo            setx YAHOO_EMAIL "you@yahoo.com"
+    echo            setx YAHOO_APP_PASSWORD "xxxx xxxx xxxx xxxx"
 )
 
 echo.
 echo =============================================
-echo   Launching Gmail Unsubscriber...
+echo   Launching Email Unsubscriber...
 echo =============================================
 echo.
 "%VENV_PYTHON%" "%CD%\gmail_unsubscriber.py"
